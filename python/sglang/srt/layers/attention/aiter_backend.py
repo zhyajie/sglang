@@ -47,6 +47,221 @@ USING_PRESHUFFLE_LAYOUT = _use_aiter and get_bool_env_var("SGLANG_ROCM_USE_AITER
 import triton
 import triton.language as tl
 
+
+@triton.jit
+def _quantize_qkv_fp8_kernel(
+    q,
+    k,
+    v,
+    q_out,
+    k_out,
+    v_out,
+    scale: float,
+    q_rows: int,
+    k_rows: int,
+    v_rows: int,
+    q_cols: int,
+    k_cols: int,
+    v_cols: int,
+    q_stride_r: int,
+    k_stride_r: int,
+    v_stride_r: int,
+    q_out_stride_r: int,
+    k_out_stride_r: int,
+    v_out_stride_r: int,
+    NUM_COL_POW2: tl.constexpr,
+):
+    """
+    Quantize q, k, v tensors to FP8 using per-tensor quantization with a single scale.
+    Supports different number of rows for q, k, v (e.g., GQA/MQA).
+    
+    Args:
+        q, k, v: Input tensors for q, k, v
+        q_out, k_out, v_out: Output tensors for quantized q, k, v
+        scale: Scale value (scalar float)
+        q_rows, k_rows, v_rows: Number of rows for each tensor
+        q_cols, k_cols, v_cols: Number of columns for each tensor
+        q_stride_r, k_stride_r, v_stride_r: Row strides for input tensors
+        q_out_stride_r, k_out_stride_r, v_out_stride_r: Row strides for output tensors
+        NUM_COL_POW2: Power-of-2 rounded number of columns (for efficient masking)
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Calculate scale reciprocal
+    scale_recip = 1.0 / scale
+    
+    # Process Q tensor with mask
+    q_offs = pid * q_stride_r + tl.arange(0, NUM_COL_POW2)
+    q_row_mask = pid < q_rows
+    q_col_mask = tl.arange(0, NUM_COL_POW2) < q_cols
+    q_mask = q_row_mask & q_col_mask
+    q_val = tl.load(q + q_offs, mask=q_mask, other=0.0, cache_modifier=".cg")
+    q_out_val = (q_val * scale_recip).to(tl.float8e4b8)
+    q_out_offs = pid * q_out_stride_r + tl.arange(0, NUM_COL_POW2)
+    tl.store(q_out + q_out_offs, q_out_val, mask=q_mask)
+    
+    # Process K tensor with mask
+    k_offs = pid * k_stride_r + tl.arange(0, NUM_COL_POW2)
+    k_row_mask = pid < k_rows
+    k_col_mask = tl.arange(0, NUM_COL_POW2) < k_cols
+    k_mask = k_row_mask & k_col_mask
+    k_val = tl.load(k + k_offs, mask=k_mask, other=0.0, cache_modifier=".cg")
+    k_out_val = (k_val * scale_recip).to(tl.float8e4b8)
+    k_out_offs = pid * k_out_stride_r + tl.arange(0, NUM_COL_POW2)
+    tl.store(k_out + k_out_offs, k_out_val, mask=k_mask)
+    
+    # Process V tensor with mask
+    v_offs = pid * v_stride_r + tl.arange(0, NUM_COL_POW2)
+    v_row_mask = pid < v_rows
+    v_col_mask = tl.arange(0, NUM_COL_POW2) < v_cols
+    v_mask = v_row_mask & v_col_mask
+    v_val = tl.load(v + v_offs, mask=v_mask, other=0.0, cache_modifier=".cg")
+    v_out_val = (v_val * scale_recip).to(tl.float8e4b8)
+    v_out_offs = pid * v_out_stride_r + tl.arange(0, NUM_COL_POW2)
+    tl.store(v_out + v_out_offs, v_out_val, mask=v_mask)
+
+
+def quantize_qkv_fp8_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Quantize q, k, v tensors to FP8 using Triton kernel in a single fused operation.
+    Supports different number of rows for q, k, v (e.g., GQA/MQA).
+    
+    Args:
+        q: Query tensor of shape [M_q, N_q]
+        k: Key tensor of shape [M_k, N_k]
+        v: Value tensor of shape [M_v, N_v]
+        scale: Scale value (scalar float)
+        quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fnuz)
+    
+    Returns:
+        q_out, k_out, v_out: Quantized tensors
+    """
+    q_rows = q.shape[0]
+    k_rows = k.shape[0]
+    v_rows = v.shape[0]
+    q_cols = q.shape[1]
+    k_cols = k.shape[1]
+    v_cols = v.shape[1]
+    
+    # Create output tensors
+    q_out = torch.empty_like(q, dtype=quant_dtype)
+    k_out = torch.empty_like(k, dtype=quant_dtype)
+    v_out = torch.empty_like(v, dtype=quant_dtype)
+    
+    # Calculate power-of-2 rounded columns for efficient masking
+    max_cols = max(q_cols, k_cols, v_cols)
+    NUM_COL_POW2 = triton.next_power_of_2(max_cols)
+    
+    # Launch kernel with grid size covering all three tensors
+    max_rows = max(q_rows, k_rows, v_rows)
+    grid = lambda meta: (max_rows,)
+    _quantize_qkv_fp8_kernel[grid](
+        q,
+        k,
+        v,
+        q_out,
+        k_out,
+        v_out,
+        scale,
+        q_rows,
+        k_rows,
+        v_rows,
+        q_cols,
+        k_cols,
+        v_cols,
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
+        q_out.stride(0),
+        k_out.stride(0),
+        v_out.stride(0),
+        NUM_COL_POW2=NUM_COL_POW2,
+    )
+    
+    return q_out, k_out, v_out
+
+
+@triton.jit
+def _quantize_q_fp8_kernel(
+    q,
+    q_out,
+    scale: float,
+    q_cols: int,
+    q_stride_r: int,
+    q_out_stride_r: int,
+    NUM_COL_POW2: tl.constexpr,
+):
+    """
+    Quantize q tensor to FP8 using per-tensor quantization.
+    
+    Args:
+        q: Input tensor for q
+        q_out: Output tensor for quantized q
+        scale: Scale value (scalar float)
+        q_cols: Number of columns
+        q_stride_r: Row stride for input tensor
+        q_out_stride_r: Row stride for output tensor
+        NUM_COL_POW2: Power-of-2 rounded number of columns
+    """
+    pid = tl.program_id(axis=0)
+    
+    # Calculate scale reciprocal
+    scale_recip = 1.0 / scale
+    
+    # Process Q tensor
+    q_offs = pid * q_stride_r + tl.arange(0, NUM_COL_POW2)
+    q_mask = tl.arange(0, NUM_COL_POW2) < q_cols
+    q_val = tl.load(q + q_offs, mask=q_mask, cache_modifier=".cg")
+    q_out_val = (q_val * scale_recip).to(tl.float8e4b8)
+    q_out_offs = pid * q_out_stride_r + tl.arange(0, NUM_COL_POW2)
+    tl.store(q_out + q_out_offs, q_out_val, mask=q_mask)
+
+
+def quantize_q_fp8_triton(
+    q: torch.Tensor,
+    scale: float,
+    quant_dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Quantize q tensor to FP8 using Triton kernel.
+    
+    Args:
+        q: Query tensor of shape [M, N_q]
+        scale: Scale value (scalar float)
+        quant_dtype: Target quantization dtype (e.g., torch.float8_e4m3fnuz)
+    
+    Returns:
+        q_out: Quantized tensor
+    """
+    M = q.shape[0]
+    q_cols = q.shape[1]
+    
+    # Create output tensor
+    q_out = torch.empty_like(q, dtype=quant_dtype)
+    
+    # Calculate power-of-2 rounded columns for efficient masking
+    NUM_COL_POW2 = triton.next_power_of_2(q_cols)
+    
+    # Launch kernel
+    grid = lambda meta: (M,)
+    _quantize_q_fp8_kernel[grid](
+        q,
+        q_out,
+        scale,
+        q_cols,
+        q.stride(0),
+        q_out.stride(0),
+        NUM_COL_POW2=NUM_COL_POW2,
+    )
+    
+    return q_out
+
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -169,6 +384,7 @@ class AiterAttnBackend(AttentionBackend):
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
             self.device
         )
+        self.fp8_scale = 1.0  # Store as scalar to avoid sync in kernel calls
 
         self.logits_soft_cap = 0.0
 
@@ -827,19 +1043,59 @@ class AiterAttnBackend(AttentionBackend):
                 torch.float8_e5m2,
                 torch.float8_e5m2fnuz,
             )
-            FP8_SCALE = torch.tensor(1.0)
-            
-            # Helper function to quantize tensor to FP8 if not already FP8
-            def quantize_to_fp8_if_needed(tensor):
-                return tensor if tensor.dtype in FP8_DTYPES else per_tensor_quant(
-                    tensor, scale=FP8_SCALE, quant_dtype=dtypes.fp8
-                )[0]
             
             # Convert q, k, v to FP8 format
+            # Reshape q to [num_tokens, num_heads, head_dim] format expected by flash_attn_varlen_fp8_pertensor_func
             q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-            q_fp8, _ = per_tensor_quant(q_reshaped, scale=FP8_SCALE, quant_dtype=dtypes.fp8)
-            k_fp8 = quantize_to_fp8_if_needed(k)
-            v_fp8 = quantize_to_fp8_if_needed(v)
+            
+            # Check if k and v are bf16 - if so, quantize all three; otherwise only quantize q
+            k_is_bf16 = k.dtype == torch.bfloat16
+            v_is_bf16 = v.dtype == torch.bfloat16
+            
+            if k_is_bf16 and v_is_bf16:
+                # Ensure k and v are in [num_tokens, num_kv_heads, head_dim] format
+                if k.dim() == 2:
+                    # k is [num_tokens, num_kv_heads * qk_head_dim], reshape to [num_tokens, num_kv_heads, qk_head_dim]
+                    k_reshaped = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                else:
+                    k_reshaped = k
+                    
+                if v.dim() == 2:
+                    # v is [num_tokens, num_kv_heads * v_head_dim], reshape to [num_tokens, num_kv_heads, v_head_dim]
+                    v_reshaped = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                else:
+                    v_reshaped = v
+                
+                # Flatten to 2D for quantization: [num_tokens * num_heads, head_dim]
+                q_flat = q_reshaped.reshape(-1, layer.head_dim)
+                k_flat = k_reshaped.reshape(-1, k_reshaped.shape[-1])
+                v_flat = v_reshaped.reshape(-1, v_reshaped.shape[-1])
+                
+                # Quantize q, k, v together in a single fused kernel
+                # The kernel supports different number of rows (GQA/MQA case)
+                q_fp8_flat, k_fp8_flat, v_fp8_flat = quantize_qkv_fp8_triton(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    self.fp8_scale,
+                    dtypes.fp8,
+                )
+                
+                # Reshape back to [num_tokens, num_heads, head_dim] format
+                q_fp8 = q_fp8_flat.view(q_reshaped.shape)
+                k_fp8 = k_fp8_flat.view(k_reshaped.shape)
+                v_fp8 = v_fp8_flat.view(v_reshaped.shape)
+            else:
+                # Only quantize q, k and v are already FP8
+                q_flat = q_reshaped.reshape(-1, layer.head_dim)
+                q_fp8_flat = quantize_q_fp8_triton(
+                    q_flat,
+                    self.fp8_scale,
+                    dtypes.fp8,
+                )
+                q_fp8 = q_fp8_flat.view(q_reshaped.shape)
+                k_fp8 = k  # Use k as-is (already FP8)
+                v_fp8 = v  # Use v as-is (already FP8)
 
             o = flash_attn_varlen_fp8_pertensor_func(
                 q=q_fp8,
