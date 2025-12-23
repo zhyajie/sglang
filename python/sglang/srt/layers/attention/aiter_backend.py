@@ -47,111 +47,6 @@ USING_PRESHUFFLE_LAYOUT = _use_aiter and get_bool_env_var("SGLANG_ROCM_USE_AITER
 import triton
 import triton.language as tl
 
-@triton.jit
-def reshape_and_cache_shuffle_kernel(
-    key_ptr,  # [num_tokens, num_kv_heads, head_size]
-    value_ptr,  # [num_tokens, num_kv_heads, head_size]
-    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, block_size, x]
-    value_cache_ptr,  # [num_blocks, num_kv_heads, block_size // x, head_size, x]
-    slot_mapping_ptr,  # [num_tokens]
-    k_scale_ptr,
-    v_scale_ptr,
-    x,
-    k_stride0,
-    v_stride0,
-    block_size,
-    head_size,
-    num_kv_heads,
-    BLOCK_SIZE: tl.constexpr,
-    QUANT: tl.constexpr,
-):
-    tid = tl.program_id(0)
-    head_id = tl.program_id(1)
-    offset = tl.arange(0, BLOCK_SIZE)
-    src_offset_k = tid * k_stride0 + head_id * head_size
-    src_offset_v = tid * v_stride0 + head_id * head_size
-    slot_id = tl.load(slot_mapping_ptr + tid)
-    if slot_id < 0:
-        return
-    block_id = slot_id // block_size
-    block_offset = slot_id % block_size
-    dst_offset = (
-        block_id * num_kv_heads * head_size * block_size
-        + head_id * head_size * block_size
-    )
-    dst_k_shuffle_offset = (
-        dst_offset + offset // x * block_size * x + block_offset * x + offset % x
-    )
-    dst_v_shuffle_offset = (
-        dst_offset
-        + block_offset // x * head_size * x
-        + offset * x
-        + block_offset % x
-    )
-    k_val = tl.load(key_ptr + src_offset_k + offset)
-    v_val = tl.load(value_ptr + src_offset_v + offset)
-    if QUANT:
-        k_scale = tl.load(k_scale_ptr)
-        v_scale = tl.load(v_scale_ptr)
-        k_dtype = key_cache_ptr.type.element_ty
-        v_dtype = value_cache_ptr.type.element_ty
-        k_val = (k_val.to(tl.float32) / k_scale).to(k_dtype)
-        v_val = (v_val.to(tl.float32) / v_scale).to(v_dtype)
-    tl.store(key_cache_ptr + dst_k_shuffle_offset, k_val)
-    tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
-
-def reshape_and_cache_shuffle_triton(
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    kv_cache_dtype: str,
-    k_scales: torch.Tensor,
-    v_scales: torch.Tensor,
-):
-    num_tokens = slot_mapping.shape[0]
-    _, num_kv_heads, head_size = key.shape
-    num_blocks, block_size, _, _ = key_cache.shape
-    x = 16 // key_cache.element_size()
-    k_cache_template = torch.empty(
-        [num_blocks, num_kv_heads, head_size // x, block_size, x],
-        dtype=key_cache.dtype,
-        device="meta",
-    )
-    v_cache_template = torch.empty(
-        [num_blocks, num_kv_heads, block_size // x, head_size, x],
-        dtype=value_cache.dtype,
-        device="meta",
-    )
-    new_key_cache = key_cache.view_as(k_cache_template)
-    new_value_cache = value_cache.view_as(v_cache_template)
-    QUANT = False
-    if kv_cache_dtype.startswith("fp8"):
-        QUANT = True
-    grid = (
-        num_tokens,
-        num_kv_heads,
-    )
-    reshape_and_cache_shuffle_kernel[grid](
-        key,
-        value,
-        new_key_cache,
-        new_value_cache,
-        slot_mapping,
-        k_scales,
-        v_scales,
-        x,
-        key.stride(0),
-        value.stride(0),
-        block_size,
-        head_size,
-        num_kv_heads,
-        BLOCK_SIZE=head_size,
-        QUANT=QUANT,
-    )
-
-
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -520,16 +415,16 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=self.device,
             )
-        if USING_PRESHUFFLE_LAYOUT:
-            self.page_table = torch.zeros(
-                (max_bs, self.max_context_len // self.page_size), dtype=torch.int32, device=self.device
-            )
-            self.seq_lens = torch.zeros(
-                (max_bs,), dtype=torch.int32, device=self.device
-            )
-            self.strided_indices = torch.arange(
-                0, self.max_context_len, self.page_size, device=self.device
-            )
+        # Always use preshuffle layout for pa_fwd_asm
+        self.page_table = torch.zeros(
+            (max_bs, self.max_context_len // self.page_size), dtype=torch.int32, device=self.device
+        )
+        self.seq_lens = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
+        self.strided_indices = torch.arange(
+            0, self.max_context_len, self.page_size, device=self.device
+        )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -570,11 +465,10 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
-            page_table = None
-            if USING_PRESHUFFLE_LAYOUT:
-                page_table = self.page_table[:bs, :]
-                self.seq_lens[:bs].copy_(seq_lens, non_blocking=True)
-                seq_lens = self.seq_lens[:bs]
+            # Always use preshuffle layout for pa_fwd_asm
+            page_table = self.page_table[:bs, :]
+            self.seq_lens[:bs].copy_(seq_lens, non_blocking=True)
+            seq_lens = self.seq_lens[:bs]
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
                 kv_indices,
@@ -687,15 +581,15 @@ class AiterAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
-            if USING_PRESHUFFLE_LAYOUT:
-                page_table_persistent = self.page_table
-                seq_lens_persistent = self.seq_lens
-                seq_lens_persistent.fill_(0)
-                page_table_persistent.fill_(0)
-                seq_lens_persistent[:bs].copy_(seq_lens, non_blocking=True)
-                max_seq_pages = (seq_lens_cpu.max().item() + self.page_size - 1) // self.page_size + 1
-                page_table = self.req_to_token[req_pool_indices[:, None], self.strided_indices[:max_seq_pages][None, :],]
-                page_table_persistent[:bs, :max_seq_pages].copy_(page_table // self.page_size, non_blocking=True)
+            # Always use preshuffle layout for pa_fwd_asm
+            page_table_persistent = self.page_table
+            seq_lens_persistent = self.seq_lens
+            seq_lens_persistent.fill_(0)
+            page_table_persistent.fill_(0)
+            seq_lens_persistent[:bs].copy_(seq_lens, non_blocking=True)
+            max_seq_pages = (seq_lens_cpu.max().item() + self.page_size - 1) // self.page_size + 1
+            page_table = self.req_to_token[req_pool_indices[:, None], self.strided_indices[:max_seq_pages][None, :],]
+            page_table_persistent[:bs, :max_seq_pages].copy_(page_table // self.page_size, non_blocking=True)
             if spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
@@ -758,34 +652,6 @@ class AiterAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def set_kv_buffer_with_layout_shuffle(
-        self,
-        cache_loc,
-        k,
-        v,
-        k_buffer,
-        v_buffer,
-        k_scale,
-        v_scale,
-        block_size,
-    ):
-        num_slots, num_kv_heads, head_dim = k_buffer.shape
-        num_blocks = num_slots // block_size
-        num_slots_with_block = num_blocks * block_size
-        k_buffer = k_buffer[:num_slots_with_block].view(num_blocks, block_size, num_kv_heads, head_dim)
-        v_buffer = v_buffer[:num_slots_with_block].view(num_blocks, block_size, num_kv_heads, head_dim)
-        reshape_and_cache_shuffle_triton(
-            k,
-            v,
-            k_buffer,
-            v_buffer,
-            cache_loc,
-            "auto",
-            k_scale,
-            v_scale,
-        )
-
-
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -803,22 +669,16 @@ class AiterAttnBackend(AttentionBackend):
 
         self.logits_soft_cap = layer.logit_cap
 
-            
         if save_kv_cache:
             assert k is not None
             assert v is not None
             if self.use_mla:
                 forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
             else:
-                if USING_PRESHUFFLE_LAYOUT:
-                    k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
-                        layer.layer_id
-                    )
-                    self.set_kv_buffer_with_layout_shuffle(cache_loc, k, v, k_buffer, v_buffer, layer.k_scale, layer.v_scale, self.page_size)
-                else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                # Shuffle operation is already fused in rotary_emb, so just save directly
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
 
         if self.use_mla:
             max_q_len = self.forward_metadata.max_q_len
@@ -937,8 +797,6 @@ class AiterAttnBackend(AttentionBackend):
                 return o
             elif forward_batch.forward_mode.is_draft_extend():
                 o = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
-                causal = True
-                sliding_window_size = -1
                 kv_indptr = self.forward_metadata.kv_indptr
                 kv_indices = self.forward_metadata.kv_indices
                 mla_prefill_fwd(
@@ -955,55 +813,11 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 K_Buffer = K_Buffer.view(-1, 1, layer.qk_head_dim)
                 return o
-                # self.extend_attention_fwd(
-                #     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                #     k.contiguous(),
-                #     v.contiguous(),
-                #     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                #     forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                #     forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                #     self.forward_metadata.qo_indptr,
-                #     kv_indptr,
-                #     kv_indices,
-                #     None,
-                #     causal,
-                #     None,
-                #     self.forward_metadata.max_q_len,
-                #     layer.scaling,
-                #     layer.logit_cap,
-                #     sliding_window_size,
-                # )
-                # return o
             else:
                 raise ValueError(
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         else:
-            if USING_PRESHUFFLE_LAYOUT:
-                import aiter
-                bs0 = forward_batch.batch_size + 1
-                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                o = torch.empty_like(q)
-                aiter.flash_attn_varlen_func(
-                    q=q,
-                    k=k,
-                    v=v,
-                    cu_seqlens_q=self.qo_indptr[:bs0],
-                    cu_seqlens_k=self.qo_indptr[:bs0],
-                    max_seqlen_q=self.forward_metadata.max_q_len,
-                    max_seqlen_k=self.forward_metadata.max_kv_len,
-                    softmax_scale=self.scale,
-                    min_seqlen_q=1,
-                    dropout_p=0.0,
-                    causal=True,
-                    out=o,
-                )
-                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
-
             bs0 = forward_batch.batch_size + 1
 
             # FP8 dtype set for checking
@@ -1050,23 +864,24 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
-        if layer.qk_head_dim != layer.v_head_dim:
-            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
-        else:
-            o = torch.empty_like(q)
+        # Create o as 3D tensor [batch_size, num_heads, head_dim] for both MLA and pa_fwd_asm
+        # In decode mode, q.shape[0] equals batch_size (each sequence has 1 token)
+        # Use q.shape[0] instead of forward_batch.batch_size to be safe
+        batch_size = q.shape[0]
+        head_dim_out = layer.v_head_dim if layer.qk_head_dim != layer.v_head_dim else layer.head_dim
+        o = q.new_empty((batch_size, layer.tp_q_head_num, head_dim_out))
 
         if save_kv_cache:
-            if USING_PRESHUFFLE_LAYOUT:
-                k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
-                    layer.layer_id
-                )
-                self.set_kv_buffer_with_layout_shuffle(forward_batch.out_cache_loc, k, v, k_buffer, v_buffer, layer.k_scale, layer.v_scale, self.page_size)
-            else:
+            if self.use_mla:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
+                )
+            else:
+                # Shuffle operation is already fused in rotary_emb, so just save directly
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
         if self.use_mla:
@@ -1085,70 +900,57 @@ class AiterAttnBackend(AttentionBackend):
             )
             k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
         else:
-            if USING_PRESHUFFLE_LAYOUT:
-                import aiter
-                k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            # Use pa_fwd_asm for decode with shuffle layout (shuffle is fused in rotary_emb)
+            import aiter
+            k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-                block_size = 16
-                num_slots, num_kv_heads, head_size = k_buffer.shape
-                num_blocks = num_slots // block_size
-                k_buffer = k_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
-                v_buffer = v_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
+            # Use page_size as block_size (pa_fwd_asm expects block_size to match page_size)
+            block_size = self.page_size
+            block_size = 16
+            
+            num_slots, num_kv_heads, head_size = k_buffer.shape
+            num_blocks = num_slots // block_size
+            k_buffer = k_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
+            v_buffer = v_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
 
-                x = 16 // k_buffer.element_size()
-                k_cache_template = torch.empty(
-                    [num_blocks, num_kv_heads, head_size // x, block_size, x],
-                    dtype=k_buffer.dtype,
-                    device="meta",
-                )
-                v_cache_template = torch.empty(
-                    [num_blocks, num_kv_heads, block_size // x, head_size, x],
-                    dtype=v_buffer.dtype,
-                    device="meta",
-                )
-                new_key_cache = k_buffer.view_as(k_cache_template)
-                new_value_cache = v_buffer.view_as(v_cache_template)
-                q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                aiter.pa_fwd_asm(
-                    Q=q,
-                    K=new_key_cache,
-                    V=new_value_cache,
-                    block_tables=self.forward_metadata.page_table,
-                    context_lens=self.forward_metadata.kv_lens,
-                    block_tables_stride0=self.forward_metadata.page_table.stride(0),
-                    K_QScale=self.k_scale,
-                    V_QScale=self.v_scale,
-                    out_=o,
-                )
-                return o
-            self.logits_soft_cap = layer.logit_cap
-            paged_attention_ragged(
-                o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                self.workspace_buffer,
-                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                    -1, 1, layer.tp_k_head_num, layer.qk_head_dim
-                ),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                    -1, 1, layer.tp_v_head_num, layer.v_head_dim
-                ),
-                self.scale,
-                self.forward_metadata.kv_indptr,
-                self.forward_metadata.kv_indices,
-                self.kv_last_page_len,
-                1,
-                self.max_num_partitions,
-                None,
-                "auto",
-                "NHD",
-                self.logits_soft_cap,
-                self.k_scale,
-                self.v_scale,
-                None,
-                _AITER_PARTITION_SIZE_ROCM,
+            # x is the number of elements per 16-byte aligned chunk
+            x = 16 // k_buffer.element_size()
+            
+            # Convert to shuffle layout for pa_fwd_asm
+            # K: [num_blocks, block_size, num_kv_heads, head_size] -> [num_blocks, num_kv_heads, head_size // x, block_size, x]
+            k_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, head_size // x, block_size, x],
+                dtype=k_buffer.dtype,
+                device="meta",
+            )
+            # V: [num_blocks, block_size, num_kv_heads, head_size] -> [num_blocks, num_kv_heads, block_size // x, head_size, x]
+            v_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                dtype=v_buffer.dtype,
+                device="meta",
+            )
+            
+            new_key_cache = k_buffer.view_as(k_cache_template)
+            new_value_cache = v_buffer.view_as(v_cache_template)
+            
+            # Reshape q to [batch_size, num_heads, head_dim] for pa_fwd_asm
+            q = q.contiguous().view(batch_size, layer.tp_q_head_num, layer.head_dim)
+            
+            # o is already created as 3D tensor [batch_size, num_heads, head_dim]
+            aiter.pa_fwd_asm(
+                Q=q,
+                K=new_key_cache,
+                V=new_value_cache,
+                block_tables=self.forward_metadata.page_table,
+                context_lens=self.forward_metadata.kv_lens,
+                block_tables_stride0=self.forward_metadata.page_table.stride(0),
+                K_QScale=self.k_scale,
+                V_QScale=self.v_scale,
+                out_=o,
             )
 
-        return o
+        # Return o as 2D tensor [batch_size, num_heads * head_dim] to match other backends
+        return o.view(-1, layer.tp_q_head_num * head_dim_out)
 
 
 class AiterIndicesUpdaterPrefill:
