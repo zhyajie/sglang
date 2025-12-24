@@ -60,9 +60,7 @@ def _quantize_qkv_fp8_kernel(
     q_rows: int,
     k_rows: int,
     v_rows: int,
-    q_cols: int,
-    k_cols: int,
-    v_cols: int,
+    cols: int,  # All tensors have the same number of columns (head_dim), must be power of 2
     q_stride_r: int,
     k_stride_r: int,
     v_stride_r: int,
@@ -74,51 +72,46 @@ def _quantize_qkv_fp8_kernel(
     """
     Quantize q, k, v tensors to FP8 using per-tensor quantization with a single scale.
     Supports different number of rows for q, k, v (e.g., GQA/MQA).
+    Assumes all tensors have the same number of columns (head_dim), which must be a power of 2.
     
     Args:
         q, k, v: Input tensors for q, k, v
         q_out, k_out, v_out: Output tensors for quantized q, k, v
         scale: Scale value (scalar float)
         q_rows, k_rows, v_rows: Number of rows for each tensor
-        q_cols, k_cols, v_cols: Number of columns for each tensor
+        cols: Number of columns (same for all tensors, must be power of 2)
         q_stride_r, k_stride_r, v_stride_r: Row strides for input tensors
         q_out_stride_r, k_out_stride_r, v_out_stride_r: Row strides for output tensors
-        NUM_COL_POW2: Power-of-2 rounded number of columns (for efficient masking)
+        NUM_COL_POW2: Power-of-2 rounded number of columns (should equal cols)
     """
     pid = tl.program_id(axis=0)
     
-    # Calculate scale reciprocal
+    # Calculate scale reciprocal once
     scale_recip = 1.0 / scale
     
-    # Process Q tensor with mask
-    q_offs = pid * q_stride_r + tl.arange(0, NUM_COL_POW2)
-    q_row_mask = pid < q_rows
-    q_col_mask = tl.arange(0, NUM_COL_POW2) < q_cols
-    q_mask = q_row_mask & q_col_mask
-    q_val = tl.load(q + q_offs, mask=q_mask, other=0.0, cache_modifier=".cg")
-    q_out_val = (q_val * scale_recip).to(tl.float8e4b8)
-    q_out_offs = pid * q_out_stride_r + tl.arange(0, NUM_COL_POW2)
-    tl.store(q_out + q_out_offs, q_out_val, mask=q_mask)
+    # Process Q tensor if pid is within q_rows
+    if pid < q_rows:
+        q_offs = pid * q_stride_r + tl.arange(0, NUM_COL_POW2)
+        q_val = tl.load(q + q_offs, cache_modifier=".cg")
+        q_out_val = (q_val * scale_recip).to(tl.float8e4b8)
+        q_out_offs = pid * q_out_stride_r + tl.arange(0, NUM_COL_POW2)
+        tl.store(q_out + q_out_offs, q_out_val)
     
-    # Process K tensor with mask
-    k_offs = pid * k_stride_r + tl.arange(0, NUM_COL_POW2)
-    k_row_mask = pid < k_rows
-    k_col_mask = tl.arange(0, NUM_COL_POW2) < k_cols
-    k_mask = k_row_mask & k_col_mask
-    k_val = tl.load(k + k_offs, mask=k_mask, other=0.0, cache_modifier=".cg")
-    k_out_val = (k_val * scale_recip).to(tl.float8e4b8)
-    k_out_offs = pid * k_out_stride_r + tl.arange(0, NUM_COL_POW2)
-    tl.store(k_out + k_out_offs, k_out_val, mask=k_mask)
+    # Process K tensor if pid is within k_rows
+    if pid < k_rows:
+        k_offs = pid * k_stride_r + tl.arange(0, NUM_COL_POW2)
+        k_val = tl.load(k + k_offs, cache_modifier=".cg")
+        k_out_val = (k_val * scale_recip).to(tl.float8e4b8)
+        k_out_offs = pid * k_out_stride_r + tl.arange(0, NUM_COL_POW2)
+        tl.store(k_out + k_out_offs, k_out_val)
     
-    # Process V tensor with mask
-    v_offs = pid * v_stride_r + tl.arange(0, NUM_COL_POW2)
-    v_row_mask = pid < v_rows
-    v_col_mask = tl.arange(0, NUM_COL_POW2) < v_cols
-    v_mask = v_row_mask & v_col_mask
-    v_val = tl.load(v + v_offs, mask=v_mask, other=0.0, cache_modifier=".cg")
-    v_out_val = (v_val * scale_recip).to(tl.float8e4b8)
-    v_out_offs = pid * v_out_stride_r + tl.arange(0, NUM_COL_POW2)
-    tl.store(v_out + v_out_offs, v_out_val, mask=v_mask)
+    # Process V tensor if pid is within v_rows
+    if pid < v_rows:
+        v_offs = pid * v_stride_r + tl.arange(0, NUM_COL_POW2)
+        v_val = tl.load(v + v_offs, cache_modifier=".cg")
+        v_out_val = (v_val * scale_recip).to(tl.float8e4b8)
+        v_out_offs = pid * v_out_stride_r + tl.arange(0, NUM_COL_POW2)
+        tl.store(v_out + v_out_offs, v_out_val)
 
 
 def quantize_qkv_fp8_triton(
@@ -145,18 +138,23 @@ def quantize_qkv_fp8_triton(
     q_rows = q.shape[0]
     k_rows = k.shape[0]
     v_rows = v.shape[0]
-    q_cols = q.shape[1]
-    k_cols = k.shape[1]
-    v_cols = v.shape[1]
+    
+    # All tensors have the same number of columns (head_dim)
+    cols = q.shape[1]
+    assert k.shape[1] == cols and v.shape[1] == cols, \
+        f"All tensors must have the same number of columns, got q={q.shape[1]}, k={k.shape[1]}, v={v.shape[1]}"
+    
+    # cols must be a power of 2 for optimal performance
+    assert (cols & (cols - 1)) == 0 and cols > 0, \
+        f"Number of columns must be a power of 2, got cols={cols}"
     
     # Create output tensors
     q_out = torch.empty_like(q, dtype=quant_dtype)
     k_out = torch.empty_like(k, dtype=quant_dtype)
     v_out = torch.empty_like(v, dtype=quant_dtype)
     
-    # Calculate power-of-2 rounded columns for efficient masking
-    max_cols = max(q_cols, k_cols, v_cols)
-    NUM_COL_POW2 = triton.next_power_of_2(max_cols)
+    # NUM_COL_POW2 should equal cols since cols is a power of 2
+    NUM_COL_POW2 = cols
     
     # Launch kernel with grid size covering all three tensors
     max_rows = max(q_rows, k_rows, v_rows)
@@ -172,9 +170,7 @@ def quantize_qkv_fp8_triton(
         q_rows,
         k_rows,
         v_rows,
-        q_cols,
-        k_cols,
-        v_cols,
+        cols,
         q.stride(0),
         k.stride(0),
         v.stride(0),
@@ -192,7 +188,7 @@ def _quantize_q_fp8_kernel(
     q,
     q_out,
     scale: float,
-    q_cols: int,
+    q_cols: int,  # Must be power of 2
     q_stride_r: int,
     q_out_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
@@ -204,10 +200,10 @@ def _quantize_q_fp8_kernel(
         q: Input tensor for q
         q_out: Output tensor for quantized q
         scale: Scale value (scalar float)
-        q_cols: Number of columns
+        q_cols: Number of columns (must be power of 2)
         q_stride_r: Row stride for input tensor
         q_out_stride_r: Row stride for output tensor
-        NUM_COL_POW2: Power-of-2 rounded number of columns
+        NUM_COL_POW2: Power-of-2 rounded number of columns (should equal q_cols)
     """
     pid = tl.program_id(axis=0)
     
@@ -216,11 +212,10 @@ def _quantize_q_fp8_kernel(
     
     # Process Q tensor
     q_offs = pid * q_stride_r + tl.arange(0, NUM_COL_POW2)
-    q_mask = tl.arange(0, NUM_COL_POW2) < q_cols
-    q_val = tl.load(q + q_offs, mask=q_mask, cache_modifier=".cg")
+    q_val = tl.load(q + q_offs, cache_modifier=".cg")
     q_out_val = (q_val * scale_recip).to(tl.float8e4b8)
     q_out_offs = pid * q_out_stride_r + tl.arange(0, NUM_COL_POW2)
-    tl.store(q_out + q_out_offs, q_out_val, mask=q_mask)
+    tl.store(q_out + q_out_offs, q_out_val)
 
 
 def quantize_q_fp8_triton(
@@ -242,11 +237,15 @@ def quantize_q_fp8_triton(
     M = q.shape[0]
     q_cols = q.shape[1]
     
+    # q_cols must be a power of 2 for optimal performance
+    assert (q_cols & (q_cols - 1)) == 0 and q_cols > 0, \
+        f"Number of columns must be a power of 2, got q_cols={q_cols}"
+    
     # Create output tensor
     q_out = torch.empty_like(q, dtype=quant_dtype)
     
-    # Calculate power-of-2 rounded columns for efficient masking
-    NUM_COL_POW2 = triton.next_power_of_2(q_cols)
+    # NUM_COL_POW2 should equal q_cols since q_cols is a power of 2
+    NUM_COL_POW2 = q_cols
     
     # Launch kernel
     grid = lambda meta: (M,)
@@ -1073,15 +1072,21 @@ class AiterAttnBackend(AttentionBackend):
                 
                 # Quantize q, k, v together in a single fused kernel
                 # The kernel supports different number of rows (GQA/MQA case)
-                q_fp8_flat, k_fp8_flat, v_fp8_flat = quantize_qkv_fp8_triton(
-                    q_flat,
-                    k_flat,
-                    v_flat,
-                    self.fp8_scale,
-                    dtypes.fp8,
-                )
+                # q_fp8_flat, k_fp8_flat, v_fp8_flat = quantize_qkv_fp8_triton(
+                #     q_flat,
+                #     k_flat,
+                #     v_flat,
+                #     self.fp8_scale,
+                #     dtypes.fp8,
+                # )
                 
-                # Reshape back to [num_tokens, num_heads, head_dim] format
+                # Use three separate quantize_q_fp8_triton calls for performance compariso
+
+                q_fp8_flat = q_flat.to(dtypes.fp8)
+                k_fp8_flat = k_flat.to(dtypes.fp8)
+                v_fp8_flat = v_flat.to(dtypes.fp8)
+                
+                # Reshape back to [num_tokens, num_heads, head_dim] forma   t
                 q_fp8 = q_fp8_flat.view(q_reshaped.shape)
                 k_fp8 = k_fp8_flat.view(k_reshaped.shape)
                 v_fp8 = v_fp8_flat.view(v_reshaped.shape)
