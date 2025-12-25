@@ -426,14 +426,14 @@ class Qwen3MoeAttention(nn.Module):
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
             layer_id = self.attn.layer_id
             k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
-            block_size = 16  # Default fallback
+            block_size = 1024  # Default fallback
             if hasattr(forward_batch, 'attn_backend') and hasattr(forward_batch.attn_backend, 'page_size'):
                 block_size = forward_batch.attn_backend.page_size
             elif hasattr(forward_batch.token_to_kv_pool, 'allocator') and hasattr(forward_batch.token_to_kv_pool.allocator, 'page_size'):
                 block_size = forward_batch.token_to_kv_pool.allocator.page_size
             elif hasattr(forward_batch.token_to_kv_pool, 'page_size'):
                 block_size = forward_batch.token_to_kv_pool.page_size
-            block_size = 16  # Default fallback
+            block_size = 1024  # Default fallback
             x = 16 // k_buffer.element_size()
             aiter_fused_set_kv_buffer_arg = AiterFusedSetKVBufferArg(
                 kv_cache = (k_buffer, v_buffer),
