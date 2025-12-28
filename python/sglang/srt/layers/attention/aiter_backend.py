@@ -35,7 +35,7 @@ try:
         mha_batch_prefill_func,
         paged_attention_ragged,
     )
-    from aiter import dtypes, per_tensor_quant, pertoken_quant
+    from aiter import dtypes, per_tensor_quant
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     print(
@@ -451,7 +451,7 @@ class AiterAttnBackend(AttentionBackend):
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = aiter.get_pa_metadata_info_v1(
-            80,
+            batch_size,
             max_qlen,
             tp_q_head_num,
             self.q_dtype,
@@ -1349,7 +1349,7 @@ class AiterAttnBackend(AttentionBackend):
             k_buffer = k_buffer[:num_blocks * kernel_block_size].view(num_blocks, kernel_block_size, num_kv_heads, head_size)
             v_buffer = v_buffer[:num_blocks * kernel_block_size].view(num_blocks, kernel_block_size, num_kv_heads, head_size)
 
-            # Per-token quantization following test_pa_ps.py pertoken_quant_kvcache_symm logic
+            # Convert to FP8 dtype (direct type conversion, no quantization)
             # Since we're not doing shuffle before quantization, we need to permute to [num_blocks, num_kv_heads, kernel_block_size, head_size]
             # for quantization, then shuffle to shuffle layout after quantization
             quant_dtype = aiter.dtypes.fp8  # FP8 E4M3FN
@@ -1368,9 +1368,9 @@ class AiterAttnBackend(AttentionBackend):
                 .contiguous()
             )  # [num_blocks, num_kv_heads, kernel_block_size, head_size]
             
-            # Apply per-token quantization
-            k_quant, k_scale_asm = pertoken_quant(k_cache_permute, quant_dtype=quant_dtype)
-            v_quant, v_scale_asm = pertoken_quant(v_cache_permute, quant_dtype=quant_dtype)
+            # Convert to FP8 dtype (no quantization, just type conversion)
+            k_quant = k_cache_permute.to(quant_dtype)
+            v_quant = v_cache_permute.to(quant_dtype)
             
             # NOTE: quant_x and original x could be different
             quant_x = 16 // quant_dtype.itemsize
@@ -1395,8 +1395,9 @@ class AiterAttnBackend(AttentionBackend):
             )  # [num_blocks, num_kv_heads, kernel_block_size // quant_x, head_size, quant_x]
             
             total_tokens = num_blocks * kernel_block_size
-            k_qscale = k_scale_asm.permute(1, 0, 2, 3).contiguous().view(num_kv_heads, total_tokens)  # [num_kv_heads, total_tokens]
-            v_qscale = v_scale_asm.permute(1, 0, 2, 3).contiguous().view(num_kv_heads, total_tokens)  # [num_kv_heads, total_tokens]
+            # Use 1.0 as scale (no quantization scaling)
+            k_qscale = torch.ones(num_kv_heads, total_tokens, dtype=torch.float32, device=self.device)  # [num_kv_heads, total_tokens]
+            v_qscale = torch.ones(num_kv_heads, total_tokens, dtype=torch.float32, device=self.device)  # [num_kv_heads, total_tokens]
             
             new_key_cache = k_quant
             new_value_cache = v_quant
