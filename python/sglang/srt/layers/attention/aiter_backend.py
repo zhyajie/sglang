@@ -7,9 +7,12 @@ end to end attention solution with aiter kernels
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional, List
+import logging
 
 import torch
 import triton
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -234,7 +237,6 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = 1
             page_table = forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices, :]
 
-
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
                 kv_indices,
@@ -248,8 +250,7 @@ class AiterAttnBackend(AttentionBackend):
             
             # Build pa_metadata for pa_persistent_fwd (only for non-MLA decode mode)
             # Use self.num_head as tp_q_head_num (assumes all layers have the same tp_q_head_num)
-            if not self.use_mla:
-                self._build_pa_metadata_for_decode(forward_batch, bs, tp_q_head_num=self.num_head)
+            
 
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
@@ -403,8 +404,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_kv_len,
                     None,
                     forward_batch.seq_lens,
-                )
-
+                )  
         if self.page_size > 1 and self.forward_metadata.page_table is not None:
             strided_indices = torch.arange(
                 0, self.forward_metadata.page_table.shape[1], self.page_size, device=self.device
@@ -412,6 +412,9 @@ class AiterAttnBackend(AttentionBackend):
             self.forward_metadata.page_table = (
                 self.forward_metadata.page_table[:, strided_indices] // self.page_size
             )
+        if forward_batch.forward_mode.is_decode_or_idle():
+            if not self.use_mla:
+                self._build_pa_metadata_for_decode(forward_batch, bs, tp_q_head_num=self.num_head)
 
     def _build_pa_metadata_for_decode(
         self, 
@@ -531,7 +534,7 @@ class AiterAttnBackend(AttentionBackend):
         # Get context_lens and ensure it's int32 (not int64)
         context_lens = self.forward_metadata.kv_lens if self.forward_metadata.kv_lens is not None else forward_batch.seq_lens
         if context_lens.dtype != torch.int32:
-            context_lens = context_lens.to(torch.int32)
+            context_lens = context_lens.to(torch.int32)           
         
         # Calculate pages_kv_indptr (cumulative number of blocks/pages)
         # pages_kv_indptr should be cumulative block counts based on kernel_block_size
@@ -1446,10 +1449,8 @@ class AiterAttnBackend(AttentionBackend):
                 K_QScale=k_qscale,  # FP8 quantization scale for K cache
                 V_QScale=v_qscale,  # FP8 quantization scale for V cache
                 softmax_scale=layer.scaling,
-                mask=1,  # Use mask=1 to match kernel config (Msk=1) and test case
+                mask=1,  
             )
-
-        # Return o as 2D tensor [batch_size, num_heads * head_dim] to match other backends
         return o.view(-1, layer.tp_q_head_num * head_dim_out)
 
 
