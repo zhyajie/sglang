@@ -32,7 +32,7 @@ try:
         mha_batch_prefill_func,
         paged_attention_ragged,
     )
-    from aiter import dtypes, per_tensor_quant
+    from aiter import dtypes, per_tensor_quant, pertoken_quant
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     print(
@@ -448,7 +448,7 @@ class AiterAttnBackend(AttentionBackend):
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
         ) = aiter.get_pa_metadata_info_v1(
-            batch_size,
+            80,
             max_qlen,
             tp_q_head_num,
             self.q_dtype,
@@ -456,6 +456,7 @@ class AiterAttnBackend(AttentionBackend):
             is_sparse=0,  # 0 for non-sparse attention
             fast_mode=True,
         )
+
         
         # Allocate metadata buffers (aligned with test_pa_ps.py lines 579-586)
         # But with buffer reuse optimization for multi-layer forward passes
@@ -611,7 +612,7 @@ class AiterAttnBackend(AttentionBackend):
             block_size=kernel_block_size,  # Should match kernel-supported block_size (1024)
             max_seqlen_qo=max_qlen,
             uni_seqlen_qo=max_qlen,  # Uniform sequence length for q/o (1 in decode mode)
-            fast_mode=False,
+            fast_mode=True,
             topk=-1,  # -1 means non-sparse attention
             max_split_per_batch=-1,  # -1 means no limit
         )
@@ -1341,39 +1342,59 @@ class AiterAttnBackend(AttentionBackend):
             num_slots, num_kv_heads, head_size = k_buffer.shape
             
             num_blocks = num_slots // kernel_block_size
+            # Reshape from [num_slots, num_kv_heads, head_size] to [num_blocks, kernel_block_size, num_kv_heads, head_size]
             k_buffer = k_buffer[:num_blocks * kernel_block_size].view(num_blocks, kernel_block_size, num_kv_heads, head_size)
             v_buffer = v_buffer[:num_blocks * kernel_block_size].view(num_blocks, kernel_block_size, num_kv_heads, head_size)
 
-            # x is the number of elements per 16-byte aligned chunk for bf16
-            x = 16 // k_buffer.element_size()
-            
-            # Convert to shuffle layout first (before quantization)
-            # K: [num_blocks, kernel_block_size, num_kv_heads, head_size] -> [num_blocks, num_kv_heads, head_size // x, kernel_block_size, x]
-            k_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, head_size // x, kernel_block_size, x],
-                dtype=k_buffer.dtype,
-                device="meta",
-            )
-            # V: [num_blocks, kernel_block_size, num_kv_heads, head_size] -> [num_blocks, num_kv_heads, kernel_block_size // x, head_size, x]
-            v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, kernel_block_size // x, head_size, x],
-                dtype=v_buffer.dtype,
-                device="meta",
-            )
-            
-            k_cache_bf16 = k_buffer.view_as(k_cache_template)
-            v_cache_bf16 = v_buffer.view_as(v_cache_template)
-            
-            # Directly convert K/V cache from bf16 to fp8
+            # Per-token quantization following test_pa_ps.py pertoken_quant_kvcache_symm logic
+            # Since we're not doing shuffle before quantization, we need to permute to [num_blocks, num_kv_heads, kernel_block_size, head_size]
+            # for quantization, then shuffle to shuffle layout after quantization
             quant_dtype = aiter.dtypes.fp8  # FP8 E4M3FN
-           
-            k_quant = k_cache_bf16.to(quant_dtype)
-            v_quant = v_cache_bf16.to(quant_dtype)
             
+            # Permute K cache from [num_blocks, kernel_block_size, num_kv_heads, head_size] 
+            # to [num_blocks, num_kv_heads, kernel_block_size, head_size] for quantization
+            k_cache_permute = (
+                k_buffer.permute(0, 2, 1, 3)
+                .contiguous()
+            )  # [num_blocks, num_kv_heads, kernel_block_size, head_size]
             
+            # Permute V cache from [num_blocks, kernel_block_size, num_kv_heads, head_size]
+            # to [num_blocks, num_kv_heads, kernel_block_size, head_size] for quantization
+            v_cache_permute = (
+                v_buffer.permute(0, 2, 1, 3)
+                .contiguous()
+            )  # [num_blocks, num_kv_heads, kernel_block_size, head_size]
+            
+            # Apply per-token quantization
+            k_quant, k_scale_asm = pertoken_quant(k_cache_permute, quant_dtype=quant_dtype)
+            v_quant, v_scale_asm = pertoken_quant(v_cache_permute, quant_dtype=quant_dtype)
+            
+            # NOTE: quant_x and original x could be different
+            quant_x = 16 // quant_dtype.itemsize
 
-            k_qscale = torch.ones(num_kv_heads, num_blocks*kernel_block_size, dtype=torch.float32, device=self.device) 
-            v_qscale = torch.ones(num_kv_heads, num_blocks*kernel_block_size, dtype=torch.float32, device=self.device)
+            
+            k_quant = (
+                k_quant.view(num_blocks, num_kv_heads, kernel_block_size, head_size // quant_x, quant_x)
+                .permute(0, 1, 3, 2, 4)
+                .contiguous()
+            )  # [num_blocks, num_kv_heads, head_size // quant_x, kernel_block_size, quant_x]
+            
+            v_quant = (
+                v_quant.view(num_blocks, num_kv_heads, kernel_block_size, head_size)
+                .permute(0, 1, 3, 2)
+                .contiguous()
+            )  # [num_blocks, num_kv_heads, head_size, kernel_block_size]
+            # Apply asm_V_shuffle logic: view -> permute
+            v_quant = (
+                v_quant.view(num_blocks, num_kv_heads, head_size, kernel_block_size // quant_x, quant_x)
+                .permute(0, 1, 3, 2, 4)
+                .contiguous()
+            )  # [num_blocks, num_kv_heads, kernel_block_size // quant_x, head_size, quant_x]
+            
+            total_tokens = num_blocks * kernel_block_size
+            k_qscale = k_scale_asm.permute(1, 0, 2, 3).contiguous().view(num_kv_heads, total_tokens)  # [num_kv_heads, total_tokens]
+            v_qscale = v_scale_asm.permute(1, 0, 2, 3).contiguous().view(num_kv_heads, total_tokens)  # [num_kv_heads, total_tokens]
+            
             new_key_cache = k_quant
             new_value_cache = v_quant
 

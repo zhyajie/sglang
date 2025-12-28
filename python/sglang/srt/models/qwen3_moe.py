@@ -441,9 +441,9 @@ class Qwen3MoeAttention(nn.Module):
                 k_scale = 1.0,
                 v_scale = 1.0,
                 return_kv = True,
-                use_shuffle_layout = True,
-                block_size = block_size,
-                x = x,
+                use_shuffle_layout = False,
+                block_size = 0,
+                x = 0,
             )
             q, k, v = self.rotary_emb(
                 qkv,
