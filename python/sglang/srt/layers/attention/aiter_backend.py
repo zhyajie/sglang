@@ -1271,13 +1271,13 @@ class AiterAttnBackend(AttentionBackend):
             bs0 = forward_batch.batch_size + 1
 
             q_fp8 = q.to(dtypes.fp8)
-            k_fp8 = k.to(dtypes.fp8)
-            v_fp8 = v.to(dtypes.fp8)
+            #k_fp8 = k.to(dtypes.fp8)
+            #v_fp8 = v.to(dtypes.fp8)
             
             o = flash_attn_varlen_fp8_pertensor_func(
                 q=q_fp8,
-                k=k_fp8,
-                v=v_fp8,
+                k=k,
+                v=v,
                 cu_seqlens_q=self.qo_indptr[:bs0],
                 cu_seqlens_k=self.forward_metadata.kv_indptr[:bs0],
                 max_seqlen_q=self.forward_metadata.max_q_len,
@@ -1339,81 +1339,40 @@ class AiterAttnBackend(AttentionBackend):
             import aiter
             
             k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-           
-            kernel_block_size = 1024  # Use kernel-supported block_size instead of page_size
-            
             num_slots, num_kv_heads, head_size = k_buffer.shape
-            
-            num_blocks = num_slots // kernel_block_size
-            # Reshape from [num_slots, num_kv_heads, head_size] to [num_blocks, kernel_block_size, num_kv_heads, head_size]
-            k_buffer = k_buffer[:num_blocks * kernel_block_size].view(num_blocks, kernel_block_size, num_kv_heads, head_size)
-            v_buffer = v_buffer[:num_blocks * kernel_block_size].view(num_blocks, kernel_block_size, num_kv_heads, head_size)
+            block_size = 1024
+            num_blocks = num_slots // block_size
+            k_buffer = k_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
+            v_buffer = v_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
 
-            # Convert to FP8 dtype (direct type conversion, no quantization)
-            # Since we're not doing shuffle before quantization, we need to permute to [num_blocks, num_kv_heads, kernel_block_size, head_size]
-            # for quantization, then shuffle to shuffle layout after quantization
+
             quant_dtype = aiter.dtypes.fp8  # FP8 E4M3FN
+            x = 16 // quant_dtype.itemsize
+            k_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, head_size // x, block_size, x],
+                dtype=k_buffer.dtype,
+                device="meta",
+            )
+            # V: [num_blocks, block_size, num_kv_heads, head_size] -> [num_blocks, num_kv_heads, block_size // x, head_size, x]
+            v_cache_template = torch.empty(
+                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                dtype=v_buffer.dtype,
+                device="meta",
+            )
+            #k_buffer = k_buffer.to(quant_dtype)
+            #v_buffer = v_buffer.to(quant_dtype)
+            new_key_cache = k_buffer.view_as(k_cache_template)
+            new_value_cache = v_buffer.view_as(v_cache_template)
+           
             
-            # Permute K cache from [num_blocks, kernel_block_size, num_kv_heads, head_size] 
-            # to [num_blocks, num_kv_heads, kernel_block_size, head_size] for quantization
-            k_cache_permute = (
-                k_buffer.permute(0, 2, 1, 3)
-                .contiguous()
-            )  # [num_blocks, num_kv_heads, kernel_block_size, head_size]
-            
-            # Permute V cache from [num_blocks, kernel_block_size, num_kv_heads, head_size]
-            # to [num_blocks, num_kv_heads, kernel_block_size, head_size] for quantization
-            v_cache_permute = (
-                v_buffer.permute(0, 2, 1, 3)
-                .contiguous()
-            )  # [num_blocks, num_kv_heads, kernel_block_size, head_size]
-            
-            # Convert to FP8 dtype (no quantization, just type conversion)
-            k_quant = k_cache_permute.to(quant_dtype)
-            v_quant = v_cache_permute.to(quant_dtype)
-            
-            # NOTE: quant_x and original x could be different
-            quant_x = 16 // quant_dtype.itemsize
-
-            
-            k_quant = (
-                k_quant.view(num_blocks, num_kv_heads, kernel_block_size, head_size // quant_x, quant_x)
-                .permute(0, 1, 3, 2, 4)
-                .contiguous()
-            )  # [num_blocks, num_kv_heads, head_size // quant_x, kernel_block_size, quant_x]
-            
-            v_quant = (
-                v_quant.view(num_blocks, num_kv_heads, kernel_block_size, head_size)
-                .permute(0, 1, 3, 2)
-                .contiguous()
-            )  # [num_blocks, num_kv_heads, head_size, kernel_block_size]
-            # Apply asm_V_shuffle logic: view -> permute
-            v_quant = (
-                v_quant.view(num_blocks, num_kv_heads, head_size, kernel_block_size // quant_x, quant_x)
-                .permute(0, 1, 3, 2, 4)
-                .contiguous()
-            )  # [num_blocks, num_kv_heads, kernel_block_size // quant_x, head_size, quant_x]
-            
-            total_tokens = num_blocks * kernel_block_size
-            # Use 1.0 as scale (no quantization scaling)
+            total_tokens = num_blocks * block_size
             k_qscale = torch.ones(num_kv_heads, total_tokens, dtype=torch.float32, device=self.device)  # [num_kv_heads, total_tokens]
             v_qscale = torch.ones(num_kv_heads, total_tokens, dtype=torch.float32, device=self.device)  # [num_kv_heads, total_tokens]
-            
-            new_key_cache = k_quant
-            new_value_cache = v_quant
 
             
             # Reshape q to [batch_size, num_heads, head_dim]
             q = q.contiguous().view(batch_size, layer.tp_q_head_num, layer.head_dim)
-            
-            # Use pre-built pa_metadata from init_forward_metadata
-            # If layer.tp_q_head_num differs from what was used to build metadata, rebuild it
-            # (This is rare as most models have the same tp_q_head_num across all layers)
-            if (self.forward_metadata.pa_metadata_tp_q_head_num is None or 
-                layer.tp_q_head_num != self.forward_metadata.pa_metadata_tp_q_head_num):
-                # Rebuild metadata for this layer (should be rare)
-                self._build_pa_metadata_for_decode(forward_batch, batch_size, tp_q_head_num=layer.tp_q_head_num)
-            
+    
 
             assert self.forward_metadata.pa_metadata_qo_indptr is not None, "pa_metadata_qo_indptr should be set by _build_pa_metadata_for_decode"
             assert self.forward_metadata.pa_metadata_pages_kv_indptr is not None, "pa_metadata_pages_kv_indptr should be set by _build_pa_metadata_for_decode"
@@ -1422,15 +1381,11 @@ class AiterAttnBackend(AttentionBackend):
             assert self.forward_metadata.pa_metadata_max_qlen is not None, "pa_metadata_max_qlen should be set by _build_pa_metadata_for_decode"
             
             qo_indptr = self.forward_metadata.pa_metadata_qo_indptr
-            pages_kv_indptr = self.forward_metadata.pa_metadata_pages_kv_indptr
+            kv_indptr = self.forward_metadata.pa_metadata_pages_kv_indptr
             kv_indices = self.forward_metadata.pa_metadata_kv_indices
             context_lens = self.forward_metadata.pa_metadata_context_lens
             max_qlen = self.forward_metadata.pa_metadata_max_qlen
             
-            # For pa_persistent_fwd, kv_indptr should be cumulative block counts (same as pages_kv_indptr)
-            kv_indptr = pages_kv_indptr
-            
-            # Call pa_persistent_fwd (output is modified in-place)
             
             _, _ = aiter.pa_persistent_fwd(
                 Q=q,

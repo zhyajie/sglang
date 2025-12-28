@@ -433,7 +433,6 @@ class Qwen3MoeAttention(nn.Module):
                 block_size = forward_batch.token_to_kv_pool.allocator.page_size
             elif hasattr(forward_batch.token_to_kv_pool, 'page_size'):
                 block_size = forward_batch.token_to_kv_pool.page_size
-            block_size = 1024  # Default fallback
             x = 16 // k_buffer.element_size()
             aiter_fused_set_kv_buffer_arg = AiterFusedSetKVBufferArg(
                 kv_cache = (k_buffer, v_buffer),
@@ -441,9 +440,9 @@ class Qwen3MoeAttention(nn.Module):
                 k_scale = 1.0,
                 v_scale = 1.0,
                 return_kv = True,
-                use_shuffle_layout = False,
-                block_size = 0,
-                x = 0,
+                use_shuffle_layout = True,
+                block_size = block_size,
+                x = x,
             )
             q, k, v = self.rotary_emb(
                 qkv,
