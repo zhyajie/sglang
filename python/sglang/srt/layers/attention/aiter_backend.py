@@ -129,6 +129,11 @@ class AiterAttnBackend(AttentionBackend):
         self.qo_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
+        # Pre-initialized qo_indptr for pa_persistent_fwd decode mode: [0, 1, 2, ..., max_bs]
+        # In decode mode, each sequence has 1 token, so this is always [0, 1, 2, ..., batch_size]
+        self.pa_decode_qo_indptr = torch.arange(
+            0, max_bs + 1, dtype=torch.int32, device=model_runner.device
+        )
         self.seq_lens = torch.zeros(
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
@@ -160,6 +165,12 @@ class AiterAttnBackend(AttentionBackend):
                 + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4,
                 dtype=torch.uint8,
                 device=self.device,
+            )
+            # Pre-allocate pa_kv_indices buffer for pa_persistent_fwd (used in both CUDA graph and non-CUDA graph modes)
+            max_num_blocks_per_seq = (self.max_context_len + self.page_size - 1) // self.page_size
+            max_total_blocks = max_bs * max_num_blocks_per_seq
+            self.pa_kv_indices = torch.zeros(
+                max_total_blocks, dtype=torch.int32, device=self.device
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
@@ -488,7 +499,6 @@ class AiterAttnBackend(AttentionBackend):
         self, 
         batch_size: int, 
         tp_q_head_num: Optional[int] = None,
-        use_cuda_graph_buffers: bool = False,
     ):
         """Build pa_metadata buffers for pa_persistent_fwd in decode mode.
         
@@ -498,7 +508,6 @@ class AiterAttnBackend(AttentionBackend):
         Args:
             batch_size: Batch size for the current forward pass
             tp_q_head_num: Number of Q heads per TP rank. If None, uses self.num_head.
-            use_cuda_graph_buffers: If True, use persistent buffers for CUDA graph compatibility.
         """
         
         
@@ -544,60 +553,34 @@ class AiterAttnBackend(AttentionBackend):
         )
         
         # Get qo_indptr for decode mode (each sequence has 1 token)
-        # qo_indptr should be [0, 1, 2, ..., batch_size]
-        qo_indptr = self.qo_indptr[: batch_size + 1]
-        qo_indptr[0] = 0
-        qo_indptr[1 : batch_size + 1] = torch.arange(1, batch_size + 1, dtype=torch.int32, device=self.device)
+        # pa_decode_qo_indptr is pre-initialized to [0, 1, 2, ..., max_bs], just take the slice
+        qo_indptr = self.pa_decode_qo_indptr[: batch_size + 1]
         
-        # Get context_lens and ensure it's int32 (not int64)
-        # Note: kv_lens is always set before calling _build_pa_metadata_for_decode
+        # Get context_lens (kv_lens is always set before calling _build_pa_metadata_for_decode)
+        # Note: kv_lens comes from self.seq_lens which is already int32
         context_lens = self.forward_metadata.kv_lens
-        if context_lens.dtype != torch.int32:
-            context_lens = context_lens.to(torch.int32)           
         
         kernel_block_size = self.page_size
         num_blocks_per_seq = (context_lens + kernel_block_size - 1) // kernel_block_size
-        # Ensure num_blocks_per_seq is int32
-        if num_blocks_per_seq.dtype != torch.int32:
-            num_blocks_per_seq = num_blocks_per_seq.to(torch.int32)
         pages_kv_indptr = self.kv_indptr[: batch_size + 1]
         pages_kv_indptr[0] = 0
-        # Ensure cumsum result is int32 (cumsum may preserve input dtype but we need int32)
-        cumsum_result = torch.cumsum(num_blocks_per_seq, dim=0)
-        if cumsum_result.dtype != torch.int32:
-            cumsum_result = cumsum_result.to(torch.int32)
-        pages_kv_indptr[1 : batch_size + 1] = cumsum_result
+        pages_kv_indptr[1 : batch_size + 1] = torch.cumsum(num_blocks_per_seq, dim=0)
         
         # Convert page_table to kv_indices (block indices)
-        # Similar to convert_to_page_indices in test_pa_ragged.py
         # page_table shape: [batch_size, max_num_blocks_per_seq]
+        # Note: page_table comes from self.page_table which is already int32 and always set before this call
         page_table = self.forward_metadata.page_table
-        if page_table is not None:
-            # Ensure page_table is int32
-            if page_table.dtype != torch.int32:
-                page_table = page_table.to(torch.int32)
-            elements_per_row = pages_kv_indptr[1:] - pages_kv_indptr[:-1]
-            col_indices = torch.arange(page_table.shape[1], device=self.device, dtype=torch.int32).expand(
-                batch_size, -1
-            )
-            mask = col_indices < elements_per_row.unsqueeze(1)
-            kv_indices_temp = page_table[mask]
-            # Ensure kv_indices is int32
-            if kv_indices_temp.dtype != torch.int32:
-                kv_indices_temp = kv_indices_temp.to(torch.int32)
-            
-            # For CUDA graph compatibility, use persistent buffer if available
-            if use_cuda_graph_buffers and hasattr(self, 'cuda_graph_pa_kv_indices'):
-                # Copy to persistent buffer for CUDA graph
-                kv_indices_len = kv_indices_temp.shape[0]
-                self.cuda_graph_pa_kv_indices[:kv_indices_len].copy_(kv_indices_temp, non_blocking=True)
-                kv_indices = self.cuda_graph_pa_kv_indices[:kv_indices_len]
-            else:
-                kv_indices = kv_indices_temp
-        else:
-            # Fallback: if page_table is not available, we need to generate it
-            # This should not happen in decode mode, but handle it gracefully
-            raise ValueError("page_table is required for pa_persistent_fwd in decode mode")
+        elements_per_row = pages_kv_indptr[1:] - pages_kv_indptr[:-1]
+        col_indices = torch.arange(page_table.shape[1], device=self.device, dtype=torch.int32).expand(
+            batch_size, -1
+        )
+        mask = col_indices < elements_per_row.unsqueeze(1)
+        kv_indices_temp = page_table[mask]
+        
+        # Copy to persistent buffer (pre-allocated in __init__ for both CUDA graph and non-CUDA graph modes)
+        kv_indices_len = kv_indices_temp.shape[0]
+        self.pa_kv_indices[:kv_indices_len].copy_(kv_indices_temp, non_blocking=True)
+        kv_indices = self.pa_kv_indices[:kv_indices_len]
         
         get_pa_metadata_v1(
             seqlens_qo_indptr=qo_indptr,
@@ -695,16 +678,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map_size,
                 reduce_partial_map_type,
             )
-            
-            # Pre-allocate buffers for pa_metadata tensors (qo_indptr, pages_kv_indptr, kv_indices, context_lens)
-            # These will be used in capture and replay phases
-            # Note: qo_indptr and pages_kv_indptr reuse self.qo_indptr and self.kv_indptr (already allocated)
-            # kv_indices needs a separate buffer (max possible size: max_bs * max_num_blocks_per_seq)
-            max_num_blocks_per_seq = (self.max_context_len + self.page_size - 1) // self.page_size
-            max_total_blocks = max_bs * max_num_blocks_per_seq
-            self.cuda_graph_pa_kv_indices = torch.zeros(
-                max_total_blocks, dtype=torch.int32, device=self.device
-            )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -774,11 +747,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 
                 # Build pa_metadata using CUDA graph buffers
-                self._build_pa_metadata_for_decode(
-                    bs, 
-                    tp_q_head_num=self.num_head,
-                    use_cuda_graph_buffers=True,
-                )
+                self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
                 return  # Early return for non-MLA decode mode
 
         elif forward_mode.is_target_verify():
@@ -942,11 +911,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 
                 # Rebuild pa_metadata using CUDA graph buffers (updates content, keeps same addresses)
-                self._build_pa_metadata_for_decode(
-                    bs, 
-                    tp_q_head_num=self.num_head,
-                    use_cuda_graph_buffers=True,
-                )
+                self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
