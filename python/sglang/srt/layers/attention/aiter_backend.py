@@ -172,6 +172,10 @@ class AiterAttnBackend(AttentionBackend):
             self.pa_kv_indices = torch.zeros(
                 max_total_blocks, dtype=torch.int32, device=self.device
             )
+            # Pre-allocate pa_kv_indptr buffer (similar to self.kv_indptr, but dedicated for pa_persistent_fwd)
+            self.pa_kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
             # Pre-initialized batch indices [0, 1, 2, ..., max_bs-1] for Triton kernel
             self.pa_batch_indices = torch.arange(
                 0, max_bs, dtype=torch.int32, device=self.device
@@ -566,7 +570,8 @@ class AiterAttnBackend(AttentionBackend):
         
         kernel_block_size = self.page_size
         num_blocks_per_seq = (context_lens + kernel_block_size - 1) // kernel_block_size
-        pages_kv_indptr = self.kv_indptr[: batch_size + 1]
+        # Use dedicated pa_kv_indptr buffer (similar to self.kv_indptr, but for pa_persistent_fwd)
+        pages_kv_indptr = self.pa_kv_indptr[: batch_size + 1]
         pages_kv_indptr[1 : batch_size + 1] = torch.cumsum(num_blocks_per_seq, dim=0)
         
         # Convert page_table to kv_indices (block indices) using Triton kernel to avoid sync
