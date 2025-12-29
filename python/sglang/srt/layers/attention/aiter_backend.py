@@ -166,11 +166,15 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=self.device,
             )
-            # Pre-allocate pa_kv_indices buffer for pa_persistent_fwd (used in both CUDA graph and non-CUDA graph modes)
+            # Pre-allocate buffers for pa_persistent_fwd (used in both CUDA graph and non-CUDA graph modes)
             max_num_blocks_per_seq = (self.max_context_len + self.page_size - 1) // self.page_size
             max_total_blocks = max_bs * max_num_blocks_per_seq
             self.pa_kv_indices = torch.zeros(
                 max_total_blocks, dtype=torch.int32, device=self.device
+            )
+            # Pre-initialized batch indices [0, 1, 2, ..., max_bs-1] for Triton kernel
+            self.pa_batch_indices = torch.arange(
+                0, max_bs, dtype=torch.int32, device=self.device
             )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
@@ -563,24 +567,25 @@ class AiterAttnBackend(AttentionBackend):
         kernel_block_size = self.page_size
         num_blocks_per_seq = (context_lens + kernel_block_size - 1) // kernel_block_size
         pages_kv_indptr = self.kv_indptr[: batch_size + 1]
-        pages_kv_indptr[0] = 0
         pages_kv_indptr[1 : batch_size + 1] = torch.cumsum(num_blocks_per_seq, dim=0)
         
-        # Convert page_table to kv_indices (block indices)
+        # Convert page_table to kv_indices (block indices) using Triton kernel to avoid sync
         # page_table shape: [batch_size, max_num_blocks_per_seq]
         # Note: page_table comes from self.page_table which is already int32 and always set before this call
         page_table = self.forward_metadata.page_table
-        elements_per_row = pages_kv_indptr[1:] - pages_kv_indptr[:-1]
-        col_indices = torch.arange(page_table.shape[1], device=self.device, dtype=torch.int32).expand(
-            batch_size, -1
-        )
-        mask = col_indices < elements_per_row.unsqueeze(1)
-        kv_indices_temp = page_table[mask]
         
-        # Copy to persistent buffer (pre-allocated in __init__ for both CUDA graph and non-CUDA graph modes)
-        kv_indices_len = kv_indices_temp.shape[0]
-        self.pa_kv_indices[:kv_indices_len].copy_(kv_indices_temp, non_blocking=True)
-        kv_indices = self.pa_kv_indices[:kv_indices_len]
+        # Use Triton kernel to gather kv_indices from page_table (avoids high-level indexing sync)
+        create_flashinfer_kv_indices_triton[(batch_size,)](
+            page_table,
+            self.pa_batch_indices[:batch_size],  # [0, 1, 2, ..., batch_size-1]
+            num_blocks_per_seq,
+            pages_kv_indptr,
+            None,  # kv_start_idx
+            self.pa_kv_indices,
+            page_table.stride(0),
+        )
+        # Use the full buffer - pa_persistent_fwd reads only valid elements based on pages_kv_indptr
+        kv_indices = self.pa_kv_indices
         
         get_pa_metadata_v1(
             seqlens_qo_indptr=qo_indptr,
