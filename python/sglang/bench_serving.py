@@ -743,11 +743,11 @@ def get_processor(
         pretrained_model_name_or_path
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
-
-    # Disable truncation when loading the processor for a quantized model.
-    # Truncation affects the `create_mm_data_row` function’s ability to correctly
-    # count input tokens (text/vision) for bench serving, which may lead to
-    # inaccurate token statistics.
+    # IMPORTANT: Disable truncation when loading the processor for a quantized model.
+    # If the tokenizer used during saving had truncation enabled, the benchmark client 
+    # may not send enough input tokens (text/vision), which can lead to incomplete inputs 
+    # and skewed benchmark serving results. Always verify 'Total input text tokens' and 
+    # 'Total input vision tokens' during benchmarking.
     return AutoProcessor.from_pretrained(
         pretrained_model_name_or_path,
         trust_remote_code=True,
