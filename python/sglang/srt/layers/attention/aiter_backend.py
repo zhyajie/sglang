@@ -28,8 +28,11 @@ try:
     from aiter import (
         flash_attn_varlen_func,
         flash_attn_varlen_fp8_pertensor_func,
+        dtypes,
+        get_pa_metadata_info_v1,
+        get_pa_metadata_v1,
+        pa_persistent_fwd,
     )
-    from aiter import dtypes
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     print(
@@ -41,11 +44,12 @@ from sglang.srt.configs.model_config import AttentionArch
 
 @dataclass
 class ForwardMetadata:
-    kv_indptr: torch.Tensor
-    kv_indices: torch.Tensor
-    qo_indptr: torch.Tensor
-    kv_last_page_len: torch.Tensor
-    max_q_len: int
+    # kv_indptr and kv_indices are only used in MLA mode, optional for non-MLA mode
+    kv_indptr: Optional[torch.Tensor]
+    kv_indices: Optional[torch.Tensor]
+    qo_indptr: Optional[torch.Tensor]
+    kv_last_page_len: Optional[torch.Tensor]
+    max_q_len: Optional[int]
     max_kv_len: Optional[int]
     page_table: Optional[torch.Tensor]
     kv_lens: Optional[torch.Tensor]
@@ -241,7 +245,7 @@ class AiterAttnBackend(AttentionBackend):
             
             # Build pa_metadata for pa_persistent_fwd (only for non-MLA decode mode)
             if not self.use_mla:
-                self._build_pa_metadata_for_decode(forward_batch, bs, tp_q_head_num=self.num_head)
+                self._build_pa_metadata_for_decode(bs, tp_q_head_num=self.num_head)
 
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
@@ -482,7 +486,6 @@ class AiterAttnBackend(AttentionBackend):
 
     def _build_pa_metadata_for_decode(
         self, 
-        forward_batch: ForwardBatch, 
         batch_size: int, 
         tp_q_head_num: Optional[int] = None,
         use_cuda_graph_buffers: bool = False,
@@ -493,20 +496,19 @@ class AiterAttnBackend(AttentionBackend):
         The metadata can be reused across multiple layers in the same forward pass.
         
         Args:
-            forward_batch: Forward batch containing sequence information
             batch_size: Batch size for the current forward pass
             tp_q_head_num: Number of Q heads per TP rank. If None, uses self.num_head.
             use_cuda_graph_buffers: If True, use persistent buffers for CUDA graph compatibility.
         """
-        import aiter
         
-        max_qlen = self.forward_metadata.max_q_len if self.forward_metadata.max_q_len is not None else 1
+        
+        max_qlen = 1
         
         # Use provided tp_q_head_num or default to self.num_head
         if tp_q_head_num is None:
             tp_q_head_num = self.num_head
         
-        kv_dtype_for_metadata = aiter.dtypes.fp8
+        kv_dtype_for_metadata = dtypes.fp8
         (
             (work_metadata_ptrs_size, work_metadata_ptrs_type),
             (work_indptr_size, work_indptr_type),
@@ -514,7 +516,7 @@ class AiterAttnBackend(AttentionBackend):
             (reduce_indptr_size, reduce_indptr_type),
             (reduce_final_map_size, reduce_final_map_type),
             (reduce_partial_map_size, reduce_partial_map_type),
-        ) = aiter.get_pa_metadata_info_v1(
+        ) = get_pa_metadata_info_v1(
             batch_size,
             max_qlen,
             tp_q_head_num,
@@ -548,7 +550,8 @@ class AiterAttnBackend(AttentionBackend):
         qo_indptr[1 : batch_size + 1] = torch.arange(1, batch_size + 1, dtype=torch.int32, device=self.device)
         
         # Get context_lens and ensure it's int32 (not int64)
-        context_lens = self.forward_metadata.kv_lens if self.forward_metadata.kv_lens is not None else forward_batch.seq_lens
+        # Note: kv_lens is always set before calling _build_pa_metadata_for_decode
+        context_lens = self.forward_metadata.kv_lens
         if context_lens.dtype != torch.int32:
             context_lens = context_lens.to(torch.int32)           
         
@@ -596,7 +599,7 @@ class AiterAttnBackend(AttentionBackend):
             # This should not happen in decode mode, but handle it gracefully
             raise ValueError("page_table is required for pa_persistent_fwd in decode mode")
         
-        aiter.get_pa_metadata_v1(
+        get_pa_metadata_v1(
             seqlens_qo_indptr=qo_indptr,
             pages_kv_indptr=pages_kv_indptr,
             context_lens=context_lens,
@@ -658,9 +661,8 @@ class AiterAttnBackend(AttentionBackend):
             # Pre-allocate pa_metadata buffers for CUDA graph compatibility
             # These buffers will be reused in capture and replay phases
             # Use max_bs and max_qlen=1 (decode mode) to calculate buffer sizes
-            import aiter
             max_qlen = 1  # decode mode
-            kv_dtype_for_metadata = aiter.dtypes.fp8
+            kv_dtype_for_metadata = dtypes.fp8
             (
                 (work_metadata_ptrs_size, work_metadata_ptrs_type),
                 (work_indptr_size, work_indptr_type),
@@ -668,7 +670,7 @@ class AiterAttnBackend(AttentionBackend):
                 (reduce_indptr_size, reduce_indptr_type),
                 (reduce_final_map_size, reduce_final_map_type),
                 (reduce_partial_map_size, reduce_partial_map_type),
-            ) = aiter.get_pa_metadata_info_v1(
+            ) = get_pa_metadata_info_v1(
                 max_bs,
                 max_qlen,
                 self.num_head,  # Use self.num_head as default tp_q_head_num
@@ -715,79 +717,35 @@ class AiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
-            qo_indptr = None
-            kv_last_page_len = None
-            max_q_len = None
-
-            if spec_info is None:
-                kv_indptr = self.kv_indptr
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-            else:
-                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-
             if self.use_mla:
+                # MLA mode: kv_indptr and kv_indices are used in forward_decode
+                kv_indptr = self.kv_indptr
+                kv_indices = self.cuda_graph_kv_indices
+                if spec_info is None:
+                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices,
+                        seq_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                else:
+                    kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+
                 qo_indptr = self.qo_indptr_[: bs + 1]
                 qo_indptr[1 : bs + 1] = torch.cumsum(
                     self.cuda_graph_kv_last_page_len[:bs], dim=0
                 )
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
-            else:
-                seq_lens_slice = seq_lens[:bs]
-                dummy_forward_batch = ForwardBatch(
-                    forward_mode=forward_mode,
-                    batch_size=bs,
-                    input_ids=torch.empty(0, dtype=torch.long, device=self.device),  # Dummy tensor
-                    req_pool_indices=req_pool_indices[:bs],
-                    seq_lens=seq_lens_slice,
-                    out_cache_loc=torch.empty(0, dtype=torch.long, device=self.device),  # Dummy tensor
-                    seq_lens_sum=seq_lens_slice.sum().item(),
-                    seq_lens_cpu=seq_lens_slice.cpu() if seq_lens_slice.is_cuda else seq_lens_slice,
-                    positions=None,
-                    spec_info=spec_info,
-                    encoder_lens=encoder_lens,
-                )
-
+                
                 page_table = self.page_table[:bs, :]
                 self.seq_lens[:bs].copy_(seq_lens, non_blocking=True)
-                seq_lens_persistent = self.seq_lens[:bs]
-                temp_forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    None,  # qo_indptr will be set by _build_pa_metadata_for_decode
-                    None,  # kv_last_page_len not used in non-MLA mode
-                    1,  # max_q_len = 1 for decode mode
-                    None,  # max_kv_len
-                    page_table,
-                    seq_lens_persistent,
-                )
-                self.forward_metadata = temp_forward_metadata
-                
-                # Build pa_metadata using CUDA graph buffers
-                self._build_pa_metadata_for_decode(
-                    dummy_forward_batch, 
-                    bs, 
-                    tp_q_head_num=self.num_head,
-                    use_cuda_graph_buffers=True,
-                )
-                
-                # Restore forward_metadata with pa_metadata included
-                qo_indptr = self.forward_metadata.pa_metadata_qo_indptr
-                kv_last_page_len = None
-                max_q_len = self.forward_metadata.pa_metadata_max_qlen
-                
-                # Create final ForwardMetadata with pa_metadata
+                seq_lens = self.seq_lens[:bs]
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
                     kv_indices,
@@ -796,30 +754,32 @@ class AiterAttnBackend(AttentionBackend):
                     max_q_len,
                     None,
                     page_table,
+                    seq_lens,
+                )
+            else:
+                # Non-MLA decode mode: kv_indptr and kv_indices are NOT used in forward_decode
+                # (forward_decode uses pa_metadata_pages_kv_indptr and pa_metadata_kv_indices instead)
+                page_table = self.page_table[:bs, :]
+                self.seq_lens[:bs].copy_(seq_lens, non_blocking=True)
+                seq_lens_persistent = self.seq_lens[:bs]
+                self.forward_metadata = ForwardMetadata(
+                    None,  # kv_indptr not used in non-MLA decode mode
+                    None,  # kv_indices not used in non-MLA decode mode
+                    None,  # qo_indptr will be set by _build_pa_metadata_for_decode
+                    None,  # kv_last_page_len not used in non-MLA mode
+                    1,  # max_q_len = 1 for decode mode
+                    None,  # max_kv_len
+                    page_table,
                     seq_lens_persistent,
-                    pa_metadata_qo_indptr=self.forward_metadata.pa_metadata_qo_indptr,
-                    pa_metadata_pages_kv_indptr=self.forward_metadata.pa_metadata_pages_kv_indptr,
-                    pa_metadata_kv_indices=self.forward_metadata.pa_metadata_kv_indices,
-                    pa_metadata_context_lens=self.forward_metadata.pa_metadata_context_lens,
-                    pa_metadata_max_qlen=self.forward_metadata.pa_metadata_max_qlen,
-                    pa_metadata_tp_q_head_num=self.forward_metadata.pa_metadata_tp_q_head_num,
+                )
+                
+                # Build pa_metadata using CUDA graph buffers
+                self._build_pa_metadata_for_decode(
+                    bs, 
+                    tp_q_head_num=self.num_head,
+                    use_cuda_graph_buffers=True,
                 )
                 return  # Early return for non-MLA decode mode
-            
-            # Always use preshuffle layout for pa_fwd_asm (MLA mode)
-            page_table = self.page_table[:bs, :]
-            self.seq_lens[:bs].copy_(seq_lens, non_blocking=True)
-            seq_lens = self.seq_lens[:bs]
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                None,
-                page_table,
-                seq_lens,
-            )
 
         elif forward_mode.is_target_verify():
             if self.use_mla:
@@ -920,9 +880,7 @@ class AiterAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
         if forward_mode.is_decode_or_idle():
-            kv_indptr = self.kv_indptr
-            kv_indices = self.cuda_graph_kv_indices
-            # Always use preshuffle layout for pa_fwd_asm
+            # Common setup for both MLA and non-MLA modes
             page_table_persistent = self.page_table
             seq_lens_persistent = self.seq_lens
             seq_lens_persistent.fill_(0)
@@ -931,43 +889,50 @@ class AiterAttnBackend(AttentionBackend):
             max_seq_pages = (seq_lens_cpu.max().item() + self.page_size - 1) // self.page_size + 1
             page_table = self.req_to_token[req_pool_indices[:, None], self.strided_indices[:max_seq_pages][None, :],]
             page_table_persistent[:bs, :max_seq_pages].copy_(page_table // self.page_size, non_blocking=True)
-            if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
+            
+            if self.use_mla:
+                # MLA mode: kv_indptr and kv_indices are used in forward_decode
+                kv_indptr = self.kv_indptr
+                kv_indices = self.cuda_graph_kv_indices
+                if spec_info is None:
+                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
+                    kv_indptr = kv_indptr[: bs + 1]
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices[:bs],
+                        seq_lens[:bs],
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
+                else:
+                    kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
+                    kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+                
+                qo_indptr = self.qo_indptr_[: bs + 1]
+                qo_indptr[1 : bs + 1] = torch.cumsum(
+                    self.cuda_graph_kv_last_page_len[:bs], dim=0
+                )
+                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+                max_q_len = 1
+                
+                self.forward_metadata = ForwardMetadata(
                     kv_indptr,
-                    None,
                     kv_indices,
-                    self.req_to_token.stride(0),
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    None,
+                    page_table_persistent[:bs, :max_seq_pages],
+                    seq_lens_persistent[:bs],
                 )
             else:
-                kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
-                kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
-            
-            # For non-MLA decode mode, update pa_metadata for pa_persistent_fwd
-            if not self.use_mla:
-                seq_lens_slice = seq_lens[:bs]
-                seq_lens_cpu_slice = seq_lens_cpu[:bs] if seq_lens_cpu is not None else seq_lens_slice.cpu()
-                dummy_forward_batch = ForwardBatch(
-                    forward_mode=forward_mode,
-                    batch_size=bs,
-                    input_ids=torch.empty(0, dtype=torch.long, device=self.device),  # Dummy tensor
-                    req_pool_indices=req_pool_indices[:bs],
-                    seq_lens=seq_lens_slice,
-                    out_cache_loc=torch.empty(0, dtype=torch.long, device=self.device),  # Dummy tensor
-                    seq_lens_sum=seq_lens_slice.sum().item(),
-                    seq_lens_cpu=seq_lens_cpu_slice,
-                    positions=None,
-                    spec_info=spec_info,
-                    encoder_lens=encoder_lens,
-                )
-
-                temp_forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
+                # Non-MLA decode mode: kv_indptr and kv_indices are NOT used in forward_decode
+                # (forward_decode uses pa_metadata_pages_kv_indptr and pa_metadata_kv_indices instead)
+                self.forward_metadata = ForwardMetadata(
+                    None,  # kv_indptr not used in non-MLA decode mode
+                    None,  # kv_indices not used in non-MLA decode mode
                     None,  
                     None,  # kv_last_page_len not used in non-MLA mode
                     1,  # max_q_len = 1 for decode mode
@@ -975,42 +940,13 @@ class AiterAttnBackend(AttentionBackend):
                     page_table_persistent[:bs, :max_seq_pages],
                     seq_lens_persistent[:bs],
                 )
-
-                self.forward_metadata = temp_forward_metadata
                 
                 # Rebuild pa_metadata using CUDA graph buffers (updates content, keeps same addresses)
                 self._build_pa_metadata_for_decode(
-                    dummy_forward_batch, 
                     bs, 
                     tp_q_head_num=self.num_head,
                     use_cuda_graph_buffers=True,
                 )
-                
-                # Update forward_metadata with pa_metadata (reuse existing ForwardMetadata if available)
-                if self.forward_metadata is not None and hasattr(self.forward_metadata, 'pa_metadata_qo_indptr'):
-                    # Update existing ForwardMetadata fields
-                    self.forward_metadata.kv_indptr = kv_indptr
-                    self.forward_metadata.kv_indices = kv_indices
-                    self.forward_metadata.page_table = page_table_persistent[:bs, :max_seq_pages]
-                    self.forward_metadata.kv_lens = seq_lens_persistent[:bs]
-                else:
-                    # Create new ForwardMetadata with pa_metadata
-                    self.forward_metadata = ForwardMetadata(
-                        kv_indptr,
-                        kv_indices,
-                        self.forward_metadata.pa_metadata_qo_indptr,
-                        None,  # kv_last_page_len not used in non-MLA mode
-                        1,  # max_q_len = 1 for decode mode
-                        None,  # max_kv_len
-                        page_table_persistent[:bs, :max_seq_pages],
-                        seq_lens_persistent[:bs],
-                        pa_metadata_qo_indptr=self.forward_metadata.pa_metadata_qo_indptr,
-                        pa_metadata_pages_kv_indptr=self.forward_metadata.pa_metadata_pages_kv_indptr,
-                        pa_metadata_kv_indices=self.forward_metadata.pa_metadata_kv_indices,
-                        pa_metadata_context_lens=self.forward_metadata.pa_metadata_context_lens,
-                        pa_metadata_max_qlen=self.forward_metadata.pa_metadata_max_qlen,
-                        pa_metadata_tp_q_head_num=self.forward_metadata.pa_metadata_tp_q_head_num,
-                    )
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -1290,8 +1226,6 @@ class AiterAttnBackend(AttentionBackend):
             )
             k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
         else:
-            import aiter
-            
             k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             num_slots, num_kv_heads, head_size = k_buffer.shape
             block_size = self.page_size
@@ -1300,7 +1234,7 @@ class AiterAttnBackend(AttentionBackend):
             v_buffer = v_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
 
 
-            quant_dtype = aiter.dtypes.fp8  # FP8 E4M3FN
+            quant_dtype = dtypes.fp8
             x = 16 // quant_dtype.itemsize
             k_cache_template = torch.empty(
                 [num_blocks, num_kv_heads, head_size // x, block_size, x],
@@ -1336,7 +1270,7 @@ class AiterAttnBackend(AttentionBackend):
             max_qlen = self.forward_metadata.pa_metadata_max_qlen
             
             
-            _, _ = aiter.pa_persistent_fwd(
+            _, _ = pa_persistent_fwd(
                 Q=q,
                 K=new_key_cache,
                 V=new_value_cache,
