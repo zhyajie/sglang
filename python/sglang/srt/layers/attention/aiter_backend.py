@@ -5,14 +5,10 @@ end to end attention solution with aiter kernels
 """
 
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional, List
-import logging
 
 import torch
 import triton
-
-logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -32,10 +28,8 @@ try:
     from aiter import (
         flash_attn_varlen_func,
         flash_attn_varlen_fp8_pertensor_func,
-        mha_batch_prefill_func,
-        paged_attention_ragged,
     )
-    from aiter import dtypes, per_tensor_quant
+    from aiter import dtypes
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
     print(
@@ -43,17 +37,6 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
-
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER")
-USING_PRESHUFFLE_LAYOUT = _use_aiter and get_bool_env_var("SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT")
-
-import triton
-import triton.language as tl
-
-
-class WrapperDispatch(Enum):
-    SLIDING_WINDOW = auto()
-    CROSS_ATTENTION = auto()
 
 
 @dataclass
@@ -74,8 +57,6 @@ class ForwardMetadata:
     pa_metadata_max_qlen: Optional[int] = None
     pa_metadata_tp_q_head_num: Optional[int] = None
 
-
-global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
@@ -194,10 +175,20 @@ class AiterAttnBackend(AttentionBackend):
 
             self.enable_dp_attention = is_dp_attention_enabled()
         
-        # Initialize metadata buffers for pa_persistent_fwd
-        # These will be allocated on-demand based on batch size
         self.pa_metadata_buffers = None
-        self.pa_metadata_initialized = False
+        
+        k_buffer, _ = model_runner.token_to_kv_pool.get_kv_buffer(first_full_attn_id)
+        num_slots, num_kv_heads, _ = k_buffer.shape
+        block_size = self.page_size
+        num_blocks = num_slots // block_size
+        max_total_tokens = num_blocks * block_size
+        self.k_qscale = torch.ones(
+            num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
+        )
+        self.v_qscale = torch.ones(
+            num_kv_heads, max_total_tokens, dtype=torch.float32, device=self.device
+        )
+           
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -249,12 +240,12 @@ class AiterAttnBackend(AttentionBackend):
             )
             
             # Build pa_metadata for pa_persistent_fwd (only for non-MLA decode mode)
-            # Use self.num_head as tp_q_head_num (assumes all layers have the same tp_q_head_num)
-            
+            if not self.use_mla:
+                self._build_pa_metadata_for_decode(forward_batch, bs, tp_q_head_num=self.num_head)
 
         elif forward_batch.forward_mode.is_draft_extend():
             if self.use_mla:
-                kv_indices, kv_indptr, qo_indptr, custom_mask = (
+                kv_indices, kv_indptr, qo_indptr, _ = (
                     spec_info.generate_attn_arg_prefill(
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
@@ -263,16 +254,15 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 )
                 self.forward_metadata = ForwardMetadata(
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    # self.mla_indices_updater_prefill.kv_last_page_len,
-                    self.kv_last_page_len[:bs],
-                    max(forward_batch.extend_seq_lens_cpu),
-                    forward_batch.seq_lens_cpu.max().item(),
-                    None,
-                    None,
-                )
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                self.kv_last_page_len[:bs],
+                max(forward_batch.extend_seq_lens_cpu),
+                forward_batch.seq_lens_cpu.max().item(),
+                None,
+                None,
+            )
             else:
                 self.indices_updater_prefill.update(
                     forward_batch.req_pool_indices,
@@ -327,7 +317,6 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indptr,
                     kv_indices,
                     qo_indptr,
-                    # self.mla_indices_updater_prefill.kv_last_page_len,
                     self.kv_last_page_len[:bs],
                     draft_num,
                     None,
@@ -357,10 +346,6 @@ class AiterAttnBackend(AttentionBackend):
             prefix_lens = forward_batch.extend_prefix_lens
             prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
-            if self.is_multimodal:
-                extend_no_prefix = False
-            else:
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             if self.use_mla:
                 self.mla_indices_updater_prefill.update(
                     forward_batch.req_pool_indices,
@@ -412,9 +397,88 @@ class AiterAttnBackend(AttentionBackend):
             self.forward_metadata.page_table = (
                 self.forward_metadata.page_table[:, strided_indices] // self.page_size
             )
-        if forward_batch.forward_mode.is_decode_or_idle():
-            if not self.use_mla:
-                self._build_pa_metadata_for_decode(forward_batch, bs, tp_q_head_num=self.num_head)
+
+    def _allocate_pa_metadata_buffers(
+        self,
+        work_metadata_ptrs_size,
+        work_metadata_ptrs_type,
+        work_indptr_size,
+        work_indptr_type,
+        work_info_size,
+        work_info_type,
+        reduce_indptr_size,
+        reduce_indptr_type,
+        reduce_final_map_size,
+        reduce_final_map_type,
+        reduce_partial_map_size,
+        reduce_partial_map_type,
+    ):
+        """Allocate or reuse pa_metadata buffers."""
+        if self.pa_metadata_buffers is None:
+            self.pa_metadata_buffers = {}
+        
+        def _get_size_val(size):
+            return size[0] if isinstance(size, tuple) else size
+        
+        # Allocate work_metadata_ptrs
+        size_val = _get_size_val(work_metadata_ptrs_size)
+        if ("work_metadata_ptrs" not in self.pa_metadata_buffers or 
+            self.pa_metadata_buffers["work_metadata_ptrs"].shape[0] < size_val):
+            self.pa_metadata_buffers["work_metadata_ptrs"] = torch.empty(
+                work_metadata_ptrs_size, dtype=work_metadata_ptrs_type, device=self.device
+            )
+        
+        # Allocate work_indptr
+        size_val = _get_size_val(work_indptr_size)
+        if ("work_indptr" not in self.pa_metadata_buffers or 
+            self.pa_metadata_buffers["work_indptr"].shape[0] < size_val):
+            self.pa_metadata_buffers["work_indptr"] = torch.zeros(
+                work_indptr_size, dtype=work_indptr_type, device=self.device
+            )
+        else:
+            self.pa_metadata_buffers["work_indptr"].zero_()
+        
+        # Allocate work_info
+        size_val = _get_size_val(work_info_size)
+        if ("work_info" not in self.pa_metadata_buffers or 
+            len(self.pa_metadata_buffers["work_info"].shape) < len(work_info_size) or
+            self.pa_metadata_buffers["work_info"].shape[0] < size_val):
+            self.pa_metadata_buffers["work_info"] = torch.zeros(
+                work_info_size, dtype=work_info_type, device=self.device
+            )
+        else:
+            self.pa_metadata_buffers["work_info"].zero_()
+        
+        # Allocate reduce_indptr
+        size_val = _get_size_val(reduce_indptr_size)
+        if ("reduce_indptr" not in self.pa_metadata_buffers or 
+            self.pa_metadata_buffers["reduce_indptr"].shape[0] < size_val):
+            self.pa_metadata_buffers["reduce_indptr"] = torch.zeros(
+                reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
+            )
+        else:
+            self.pa_metadata_buffers["reduce_indptr"].zero_()
+        
+        # Allocate reduce_final_map
+        size_val = _get_size_val(reduce_final_map_size)
+        if ("reduce_final_map" not in self.pa_metadata_buffers or 
+            len(self.pa_metadata_buffers["reduce_final_map"].shape) < len(reduce_final_map_size) or
+            self.pa_metadata_buffers["reduce_final_map"].shape[0] < size_val):
+            self.pa_metadata_buffers["reduce_final_map"] = torch.zeros(
+                reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
+            )
+        else:
+            self.pa_metadata_buffers["reduce_final_map"].zero_()
+        
+        # Allocate reduce_partial_map
+        reduce_partial_map_size_val = reduce_partial_map_size if isinstance(reduce_partial_map_size, int) else reduce_partial_map_size[0]
+        if ("reduce_partial_map" not in self.pa_metadata_buffers or 
+            self.pa_metadata_buffers["reduce_partial_map"].shape[0] < reduce_partial_map_size_val):
+            self.pa_metadata_buffers["reduce_partial_map"] = torch.zeros(
+                reduce_partial_map_size, dtype=reduce_partial_map_type, device=self.device
+            )
+        else:
+            self.pa_metadata_buffers["reduce_partial_map"].zero_()
 
     def _build_pa_metadata_for_decode(
         self, 
@@ -461,69 +525,21 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         
-        # Allocate metadata buffers (aligned with test_pa_ps.py lines 579-586)
-        # But with buffer reuse optimization for multi-layer forward passes
-        if self.pa_metadata_buffers is None:
-            self.pa_metadata_buffers = {}
-        
-        # Check if buffers exist and are large enough, reuse if possible
-        # This allows multiple layers to reuse buffers in the same forward pass
-        # get_pa_metadata_info_v1 returns sizes as tuples: (size,) for 1D or (size1, size2) for 2D
-        work_metadata_ptrs_size_val = work_metadata_ptrs_size[0] if isinstance(work_metadata_ptrs_size, tuple) else work_metadata_ptrs_size
-        if ("work_metadata_ptrs" not in self.pa_metadata_buffers or 
-            self.pa_metadata_buffers["work_metadata_ptrs"].shape[0] < work_metadata_ptrs_size_val):
-            self.pa_metadata_buffers["work_metadata_ptrs"] = torch.empty(
-                work_metadata_ptrs_size, dtype=work_metadata_ptrs_type, device=self.device
-            )
-        
-        work_indptr_size_val = work_indptr_size[0] if isinstance(work_indptr_size, tuple) else work_indptr_size
-        if ("work_indptr" not in self.pa_metadata_buffers or 
-            self.pa_metadata_buffers["work_indptr"].shape[0] < work_indptr_size_val):
-            self.pa_metadata_buffers["work_indptr"] = torch.zeros(
-                work_indptr_size, dtype=work_indptr_type, device=self.device
-            )
-        else:
-            # Zero out buffer if reusing (required before get_pa_metadata_v1 fills it)
-            self.pa_metadata_buffers["work_indptr"].zero_()
-        
-        work_info_size_val = work_info_size[0] if isinstance(work_info_size, tuple) else work_info_size
-        if ("work_info" not in self.pa_metadata_buffers or 
-            len(self.pa_metadata_buffers["work_info"].shape) < len(work_info_size) or
-            self.pa_metadata_buffers["work_info"].shape[0] < work_info_size_val):
-            self.pa_metadata_buffers["work_info"] = torch.zeros(
-                work_info_size, dtype=work_info_type, device=self.device
-            )
-        else:
-            self.pa_metadata_buffers["work_info"].zero_()
-        
-        reduce_indptr_size_val = reduce_indptr_size[0] if isinstance(reduce_indptr_size, tuple) else reduce_indptr_size
-        if ("reduce_indptr" not in self.pa_metadata_buffers or 
-            self.pa_metadata_buffers["reduce_indptr"].shape[0] < reduce_indptr_size_val):
-            self.pa_metadata_buffers["reduce_indptr"] = torch.zeros(
-                reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
-            )
-        else:
-            self.pa_metadata_buffers["reduce_indptr"].zero_()
-        
-        reduce_final_map_size_val = reduce_final_map_size[0] if isinstance(reduce_final_map_size, tuple) else reduce_final_map_size
-        if ("reduce_final_map" not in self.pa_metadata_buffers or 
-            len(self.pa_metadata_buffers["reduce_final_map"].shape) < len(reduce_final_map_size) or
-            self.pa_metadata_buffers["reduce_final_map"].shape[0] < reduce_final_map_size_val):
-            self.pa_metadata_buffers["reduce_final_map"] = torch.zeros(
-                reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
-            )
-        else:
-            self.pa_metadata_buffers["reduce_final_map"].zero_()
-        
-        # reduce_partial_map_size is an int, not a tuple (from get_pa_metadata_info_v1 line 534)
-        reduce_partial_map_size_val = reduce_partial_map_size if isinstance(reduce_partial_map_size, int) else reduce_partial_map_size[0]
-        if ("reduce_partial_map" not in self.pa_metadata_buffers or 
-            self.pa_metadata_buffers["reduce_partial_map"].shape[0] < reduce_partial_map_size_val):
-            self.pa_metadata_buffers["reduce_partial_map"] = torch.zeros(
-                reduce_partial_map_size, dtype=reduce_partial_map_type, device=self.device
-            )
-        else:
-            self.pa_metadata_buffers["reduce_partial_map"].zero_()
+        # Allocate metadata buffers with reuse optimization for multi-layer forward passes
+        self._allocate_pa_metadata_buffers(
+            work_metadata_ptrs_size,
+            work_metadata_ptrs_type,
+            work_indptr_size,
+            work_indptr_type,
+            work_info_size,
+            work_info_type,
+            reduce_indptr_size,
+            reduce_indptr_type,
+            reduce_final_map_size,
+            reduce_final_map_type,
+            reduce_partial_map_size,
+            reduce_partial_map_type,
+        )
         
         # Get qo_indptr for decode mode (each sequence has 1 token)
         # qo_indptr should be [0, 1, 2, ..., batch_size]
@@ -536,10 +552,7 @@ class AiterAttnBackend(AttentionBackend):
         if context_lens.dtype != torch.int32:
             context_lens = context_lens.to(torch.int32)           
         
-        # Calculate pages_kv_indptr (cumulative number of blocks/pages)
-        # pages_kv_indptr should be cumulative block counts based on kernel_block_size
-        # Note: This should match the block_size used in K cache reshape (1024)
-        kernel_block_size = 1024  # Use kernel-supported block_size instead of page_size
+        kernel_block_size = self.page_size
         num_blocks_per_seq = (context_lens + kernel_block_size - 1) // kernel_block_size
         # Ensure num_blocks_per_seq is int32
         if num_blocks_per_seq.dtype != torch.int32:
@@ -583,21 +596,6 @@ class AiterAttnBackend(AttentionBackend):
             # This should not happen in decode mode, but handle it gracefully
             raise ValueError("page_table is required for pa_persistent_fwd in decode mode")
         
-        # Fill metadata buffers for pa_persistent_fwd
-        # These metadata buffers are used by the persistent scheduling kernel to:
-        # - work_metadata_ptrs: Two 64-bit pointers to work_indptr and work_info (internal use)
-        # - work_indptr: [num_cu_part + 1] - Work IDs handled by each compute unit partition
-        # - work_info: [num_works, 8] - Work information including:
-        #   * bs_index: batch index for each work
-        #   * partial_index: tile index in output buffer when splits occur (-1 if no split)
-        #   * q_start/q_end: global indices where q/o starts/ends
-        #   * kv_start/kv_end: global indices in kv_indices where k/v starts/ends
-        #   * kv_offset: not used
-        #   * q_head_range: start/end indices of q heads (packed in 32 bits)
-        # - reduce_indptr: [sum(qo_seqlen_blk_count) + 1] - IDs in reduce_partial_map for merging tiles
-        # - reduce_final_map: [sum(qo_seqlen_blk_count), 2] - Final output location of each tile group
-        # - reduce_partial_map: [num_partial_tiles] - Locations in partial buffer waiting for reduction
-        
         aiter.get_pa_metadata_v1(
             seqlens_qo_indptr=qo_indptr,
             pages_kv_indptr=pages_kv_indptr,
@@ -611,13 +609,13 @@ class AiterAttnBackend(AttentionBackend):
             reduce_indptr=self.pa_metadata_buffers["reduce_indptr"],
             reduce_final_map=self.pa_metadata_buffers["reduce_final_map"],
             reduce_partial_map=self.pa_metadata_buffers["reduce_partial_map"],
-            kv_granularity=max(kernel_block_size, 16),  # Granularity for KV sequence length when cutting batch (min 16)
-            block_size=kernel_block_size,  # Should match kernel-supported block_size (1024)
+            kv_granularity=max(kernel_block_size, 16),
+            block_size=kernel_block_size,
             max_seqlen_qo=max_qlen,
-            uni_seqlen_qo=max_qlen,  # Uniform sequence length for q/o (1 in decode mode)
+            uni_seqlen_qo=max_qlen,
             fast_mode=True,
-            topk=-1,  # -1 means non-sparse attention
-            max_split_per_batch=-1,  # -1 means no limit
+            topk=-1,
+            max_split_per_batch=-1,
         )
         
         # Store computed values in ForwardMetadata for reuse in forward_decode
@@ -644,12 +642,6 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
 
-        if not self.skip_prefill:
-            self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
-                dtype=torch.uint8,
-                device=self.device,
-            )
         # Always use preshuffle layout for pa_fwd_asm
         self.page_table = torch.zeros(
             (max_bs, self.max_context_len // self.page_size), dtype=torch.int32, device=self.device
@@ -686,67 +678,31 @@ class AiterAttnBackend(AttentionBackend):
                 fast_mode=True,
             )
             
-            # Initialize pa_metadata_buffers if not already initialized
-            if self.pa_metadata_buffers is None:
-                self.pa_metadata_buffers = {}
-            
             # Pre-allocate buffers with maximum size for CUDA graph compatibility
-            work_metadata_ptrs_size_val = work_metadata_ptrs_size[0] if isinstance(work_metadata_ptrs_size, tuple) else work_metadata_ptrs_size
-            if ("work_metadata_ptrs" not in self.pa_metadata_buffers or 
-                self.pa_metadata_buffers["work_metadata_ptrs"].shape[0] < work_metadata_ptrs_size_val):
-                self.pa_metadata_buffers["work_metadata_ptrs"] = torch.empty(
-                    work_metadata_ptrs_size, dtype=work_metadata_ptrs_type, device=self.device
-                )
-            
-            work_indptr_size_val = work_indptr_size[0] if isinstance(work_indptr_size, tuple) else work_indptr_size
-            if ("work_indptr" not in self.pa_metadata_buffers or 
-                self.pa_metadata_buffers["work_indptr"].shape[0] < work_indptr_size_val):
-                self.pa_metadata_buffers["work_indptr"] = torch.zeros(
-                    work_indptr_size, dtype=work_indptr_type, device=self.device
-                )
-            
-            work_info_size_val = work_info_size[0] if isinstance(work_info_size, tuple) else work_info_size
-            if ("work_info" not in self.pa_metadata_buffers or 
-                len(self.pa_metadata_buffers["work_info"].shape) < len(work_info_size) or
-                self.pa_metadata_buffers["work_info"].shape[0] < work_info_size_val):
-                self.pa_metadata_buffers["work_info"] = torch.zeros(
-                    work_info_size, dtype=work_info_type, device=self.device
-                )
-            
-            reduce_indptr_size_val = reduce_indptr_size[0] if isinstance(reduce_indptr_size, tuple) else reduce_indptr_size
-            if ("reduce_indptr" not in self.pa_metadata_buffers or 
-                self.pa_metadata_buffers["reduce_indptr"].shape[0] < reduce_indptr_size_val):
-                self.pa_metadata_buffers["reduce_indptr"] = torch.zeros(
-                    reduce_indptr_size, dtype=reduce_indptr_type, device=self.device
-                )
-            
-            reduce_final_map_size_val = reduce_final_map_size[0] if isinstance(reduce_final_map_size, tuple) else reduce_final_map_size
-            if ("reduce_final_map" not in self.pa_metadata_buffers or 
-                len(self.pa_metadata_buffers["reduce_final_map"].shape) < len(reduce_final_map_size) or
-                self.pa_metadata_buffers["reduce_final_map"].shape[0] < reduce_final_map_size_val):
-                self.pa_metadata_buffers["reduce_final_map"] = torch.zeros(
-                    reduce_final_map_size, dtype=reduce_final_map_type, device=self.device
-                )
-            
-            reduce_partial_map_size_val = reduce_partial_map_size if isinstance(reduce_partial_map_size, int) else reduce_partial_map_size[0]
-            if ("reduce_partial_map" not in self.pa_metadata_buffers or 
-                self.pa_metadata_buffers["reduce_partial_map"].shape[0] < reduce_partial_map_size_val):
-                self.pa_metadata_buffers["reduce_partial_map"] = torch.zeros(
-                    reduce_partial_map_size, dtype=reduce_partial_map_type, device=self.device
-                )
+            self._allocate_pa_metadata_buffers(
+                work_metadata_ptrs_size,
+                work_metadata_ptrs_type,
+                work_indptr_size,
+                work_indptr_type,
+                work_info_size,
+                work_info_type,
+                reduce_indptr_size,
+                reduce_indptr_type,
+                reduce_final_map_size,
+                reduce_final_map_type,
+                reduce_partial_map_size,
+                reduce_partial_map_type,
+            )
             
             # Pre-allocate buffers for pa_metadata tensors (qo_indptr, pages_kv_indptr, kv_indices, context_lens)
             # These will be used in capture and replay phases
             # Note: qo_indptr and pages_kv_indptr reuse self.qo_indptr and self.kv_indptr (already allocated)
             # kv_indices needs a separate buffer (max possible size: max_bs * max_num_blocks_per_seq)
-            max_num_blocks_per_seq = (self.max_context_len + 1024 - 1) // 1024  # kernel_block_size = 1024
+            max_num_blocks_per_seq = (self.max_context_len + self.page_size - 1) // self.page_size
             max_total_blocks = max_bs * max_num_blocks_per_seq
             self.cuda_graph_pa_kv_indices = torch.zeros(
                 max_total_blocks, dtype=torch.int32, device=self.device
             )
-            # context_lens can reuse self.seq_lens (already allocated)
-            # pages_kv_indptr can reuse self.kv_indptr (already allocated)
-            # qo_indptr can reuse self.qo_indptr (already allocated)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1271,8 +1227,6 @@ class AiterAttnBackend(AttentionBackend):
             bs0 = forward_batch.batch_size + 1
 
             q_fp8 = q.to(dtypes.fp8)
-            #k_fp8 = k.to(dtypes.fp8)
-            #v_fp8 = v.to(dtypes.fp8)
             
             o = flash_attn_varlen_fp8_pertensor_func(
                 q=q_fp8,
@@ -1340,7 +1294,7 @@ class AiterAttnBackend(AttentionBackend):
             
             k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
             num_slots, num_kv_heads, head_size = k_buffer.shape
-            block_size = 1024
+            block_size = self.page_size
             num_blocks = num_slots // block_size
             k_buffer = k_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
             v_buffer = v_buffer[:num_blocks * block_size].view(num_blocks, block_size, num_kv_heads, head_size)
@@ -1359,19 +1313,14 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=v_buffer.dtype,
                 device="meta",
             )
-            #k_buffer = k_buffer.to(quant_dtype)
-            #v_buffer = v_buffer.to(quant_dtype)
             new_key_cache = k_buffer.view_as(k_cache_template)
             new_value_cache = v_buffer.view_as(v_cache_template)
-           
             
             total_tokens = num_blocks * block_size
-            k_qscale = torch.ones(num_kv_heads, total_tokens, dtype=torch.float32, device=self.device)  # [num_kv_heads, total_tokens]
-            v_qscale = torch.ones(num_kv_heads, total_tokens, dtype=torch.float32, device=self.device)  # [num_kv_heads, total_tokens]
-
+            k_qscale = self.k_qscale[:, :total_tokens]
+            v_qscale = self.v_qscale[:, :total_tokens]
             
-            # Reshape q to [batch_size, num_heads, head_dim]
-            q = q.contiguous().view(batch_size, layer.tp_q_head_num, layer.head_dim)
+            q = q.view(batch_size, layer.tp_q_head_num, layer.head_dim)
     
 
             assert self.forward_metadata.pa_metadata_qo_indptr is not None, "pa_metadata_qo_indptr should be set by _build_pa_metadata_for_decode"
@@ -1402,8 +1351,8 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr=self.pa_metadata_buffers["reduce_indptr"],
                 reduce_final_map=self.pa_metadata_buffers["reduce_final_map"],
                 reduce_partial_map=self.pa_metadata_buffers["reduce_partial_map"],
-                K_QScale=k_qscale,  # FP8 quantization scale for K cache
-                V_QScale=v_qscale,  # FP8 quantization scale for V cache
+                K_QScale=k_qscale,
+                V_QScale=v_qscale,
                 softmax_scale=layer.scaling,
                 mask=1,  
             )
@@ -1516,9 +1465,8 @@ class AiterIndicesUpdaterPrefill:
 
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            custom_mask = None
         else:
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
+            kv_indices, kv_indptr, qo_indptr, _ = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
                     paged_kernel_lens,
@@ -1596,7 +1544,7 @@ class AiterMlaIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
         else:
-            kv_indices, kv_indptr, qo_indptr, custom_mask = (
+            kv_indices, kv_indptr, qo_indptr, _ = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
                     kv_lens,
