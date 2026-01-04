@@ -1988,6 +1988,13 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        import logging
+        import time
+
+        logger = logging.getLogger(__name__)
+        torch.cuda.synchronize()
+        prefill_start_time = time.time()
+
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
@@ -2002,7 +2009,13 @@ class ModelRunner:
         if self.piecewise_cuda_graph_runner is not None:
             if self.piecewise_cuda_graph_runner.can_run(forward_batch):
                 return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
-
+        # Synchronize before model forward timing
+        torch.cuda.synchronize()
+        model_forward_start = time.time()
+        prefill_prep_time = model_forward_start - prefill_start_time
+        logger.info(
+            f"[TTFT_BREAKDOWN] Prefill preparation time: {prefill_prep_time * 1000:.2f} ms"
+        )
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,

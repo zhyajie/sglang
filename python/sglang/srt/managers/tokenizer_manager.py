@@ -643,6 +643,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     input_text, is_cross_encoder_request
                 )
 
+        # Timing stats for profiling
+        ts_mm_process_done = None
+
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
@@ -657,14 +660,26 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+            ts_mm_process_done = time.time()
         else:
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
+        ts_validate_done = time.time()
+
         trace_slice_end("tokenize", obj.rid)
-        return self._create_tokenized_object(
+        tokenized_obj = self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+        ts_create_obj_done = time.time()
+
+        # Attach timing stats to tokenized object for profiling
+        if hasattr(tokenized_obj, 'ts_mm_process_done'):
+            tokenized_obj.ts_mm_process_done = ts_mm_process_done
+            tokenized_obj.ts_validate_done = ts_validate_done
+            tokenized_obj.ts_create_obj_done = ts_create_obj_done
+
+        return tokenized_obj
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -908,6 +923,33 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         trace_slice_start("dispatch", obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
+
+        # Record timing for profiling IPC transfer
+        if hasattr(tokenized_obj, 'ts_send_time'):
+            # Measure serialization time by doing pickle manually
+            import pickle
+            ts_serialize_start = time.time()
+            serialized_data = pickle.dumps(tokenized_obj)
+            ts_serialize_done = time.time()
+
+            # Record the serialization time and serialized size
+            serialize_time_ms = (ts_serialize_done - ts_serialize_start) * 1000
+            serialized_size_kb = len(serialized_data) / 1024
+
+            # Store timing info (will be logged in scheduler)
+            tokenized_obj.ts_serialize_start = ts_serialize_start
+            tokenized_obj.ts_serialize_done = ts_serialize_done
+            tokenized_obj.serialized_size_kb = serialized_size_kb
+
+            # Log serialization info on tokenizer side
+            logger.info(
+                f"[Profiling-Tokenizer] rid={obj.rid}, "
+                f"serialize_time={serialize_time_ms:.2f}ms, "
+                f"serialized_size={serialized_size_kb:.2f}KB"
+            )
+
+            tokenized_obj.ts_send_time = time.time()
+
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state

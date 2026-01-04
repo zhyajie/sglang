@@ -1124,7 +1124,15 @@ class Scheduler(
 
                 while True:
                     try:
+                        # Record time before recv (includes deserialize)
+                        ts_before_recv = time.time()
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        ts_after_recv = time.time()
+
+                        # Attach deserialize timing info to request for profiling
+                        if hasattr(recv_req, 'ts_send_time'):
+                            recv_req._ts_deserialize_done = ts_after_recv
+                            recv_req._deserialize_time_ms = (ts_after_recv - ts_before_recv) * 1000
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1255,6 +1263,38 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # Record receive time for profiling
+        ts_recv_time = time.time()
+
+        # Log IPC transfer breakdown if profiling info is available
+        if hasattr(recv_req, 'ts_send_time') and recv_req.ts_send_time:
+            ts_send = recv_req.ts_send_time
+            ts_serialize_done = getattr(recv_req, 'ts_serialize_done', None)
+            deserialize_time_ms = getattr(recv_req, '_deserialize_time_ms', None)
+            serialized_size_kb = getattr(recv_req, 'serialized_size_kb', None)
+
+            # Calculate IPC breakdown
+            total_ipc_time = (ts_recv_time - ts_send) * 1000
+
+            # zmq_transfer = total_ipc - deserialize (if we have deserialize time)
+            if deserialize_time_ms is not None:
+                zmq_transfer_time = total_ipc_time - deserialize_time_ms
+            else:
+                zmq_transfer_time = None
+                deserialize_time_ms = 0
+
+            # Build log message
+            log_parts = [
+                f"[Profiling-IPC] rid={recv_req.rid}",
+                f"total_ipc={total_ipc_time:.2f}ms",
+            ]
+            if zmq_transfer_time is not None:
+                log_parts.append(f"zmq_transfer={zmq_transfer_time:.2f}ms")
+            log_parts.append(f"deserialize={deserialize_time_ms:.2f}ms")
+            if serialized_size_kb is not None:
+                log_parts.append(f"size={serialized_size_kb:.2f}KB")
+            logger.info(", ".join(log_parts))
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1332,12 +1372,25 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
+            ts_mm_from_dict_start = time.time()
             image_inputs = MultimodalInputs.from_dict(recv_req.mm_inputs)
+            ts_mm_from_dict_done = time.time()
+
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
             )
+            ts_pad_input_done = time.time()
+
             req.extend_image_inputs(image_inputs)
+            ts_extend_image_done = time.time()
+
+            logger.info(
+                f"[Profiling-Scheduler] rid={req.rid}, "
+                f"mm_from_dict={((ts_mm_from_dict_done - ts_mm_from_dict_start) * 1000):.2f}ms, "
+                f"pad_input_ids={((ts_pad_input_done - ts_mm_from_dict_done) * 1000):.2f}ms, "
+                f"extend_image={((ts_extend_image_done - ts_pad_input_done) * 1000):.2f}ms"
+            )
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -1418,6 +1471,15 @@ class Scheduler(
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
 
+        # Attach timing stats from recv_req and ts_recv_time for profiling
+        req._profiling_ts = {
+            "ts_mm_process_done": getattr(recv_req, 'ts_mm_process_done', None),
+            "ts_validate_done": getattr(recv_req, 'ts_validate_done', None),
+            "ts_create_obj_done": getattr(recv_req, 'ts_create_obj_done', None),
+            "ts_send_time": getattr(recv_req, 'ts_send_time', None),
+            "ts_recv_time": ts_recv_time,
+        }
+
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
         else:
@@ -1465,6 +1527,53 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
+            req.scheduler_receive_time = time.time()
+
+            # ===== Print profiling timing stats for multimodal requests =====
+            if hasattr(req, '_profiling_ts') and req._profiling_ts:
+                ts = req._profiling_ts
+                ts_queue_done = time.time()
+
+                # Build timing breakdown
+                timing_parts = []
+
+                # mm_process time (from validate_done - mm_process_done gives validation time)
+                if ts.get("ts_mm_process_done") and ts.get("ts_validate_done"):
+                    mm_process_time = ts["ts_validate_done"] - ts["ts_mm_process_done"]
+                    timing_parts.append(f"mm_process_to_validate={mm_process_time*1000:.2f}ms")
+
+                # validate to create_obj
+                if ts.get("ts_validate_done") and ts.get("ts_create_obj_done"):
+                    validate_to_create = ts["ts_create_obj_done"] - ts["ts_validate_done"]
+                    timing_parts.append(f"validate_to_create_obj={validate_to_create*1000:.2f}ms")
+
+                # create_obj to send
+                if ts.get("ts_create_obj_done") and ts.get("ts_send_time"):
+                    create_to_send = ts["ts_send_time"] - ts["ts_create_obj_done"]
+                    timing_parts.append(f"create_obj_to_send={create_to_send*1000:.2f}ms")
+
+                # IPC transfer time: send to recv
+                if ts.get("ts_send_time") and ts.get("ts_recv_time"):
+                    ipc_time = ts["ts_recv_time"] - ts["ts_send_time"]
+                    timing_parts.append(f"ipc_transfer(send_to_recv)={ipc_time*1000:.2f}ms")
+
+                # scheduler processing: recv to queue
+                if ts.get("ts_recv_time"):
+                    sched_process = ts_queue_done - ts["ts_recv_time"]
+                    timing_parts.append(f"sched_process(recv_to_queue)={sched_process*1000:.2f}ms")
+
+                # Total: mm_process_done to queue (if mm_process_done exists)
+                if ts.get("ts_mm_process_done"):
+                    total_time = ts_queue_done - ts["ts_mm_process_done"]
+                    timing_parts.append(f"total(mm_done_to_queue)={total_time*1000:.2f}ms")
+                elif ts.get("ts_validate_done"):
+                    # For non-multimodal, use validate_done as start
+                    total_time = ts_queue_done - ts["ts_validate_done"]
+                    timing_parts.append(f"total(validate_to_queue)={total_time*1000:.2f}ms")
+
+                if timing_parts:
+                    logger.info(f"[Profiling] rid={req.rid}, {', '.join(timing_parts)}")
+
             trace_slice_end("process req", req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)

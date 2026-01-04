@@ -643,6 +643,22 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # ===== Timing stats for multimodal request profiling =====
+    # Timestamp after mm_data_processor.process() generates input_ids and mm_inputs
+    ts_mm_process_done: Optional[float] = None
+    # Timestamp after _validate_one_request() completes
+    ts_validate_done: Optional[float] = None
+    # Timestamp after _create_tokenized_object() completes
+    ts_create_obj_done: Optional[float] = None
+    # Timestamp when serialization starts
+    ts_serialize_start: Optional[float] = None
+    # Timestamp when serialization completes
+    ts_serialize_done: Optional[float] = None
+    # Serialized data size in KB
+    serialized_size_kb: Optional[float] = None
+    # Timestamp when _send_one_request() sends the request
+    ts_send_time: Optional[float] = None
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
