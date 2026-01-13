@@ -539,6 +539,15 @@ class QwenImageCrossAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         **cross_attention_kwargs,
     ):
+        # === 输入到 QwenImageCrossAttention ===
+        # hidden_states: [B, S_img_local, D] = [B, noisy_local + cond_full, D]
+        # encoder_hidden_states: [B, S_txt, D] (replicated)
+        logger.info(
+            f"[QwenImageCrossAttention] Input: "
+            f"hidden_states(img)={hidden_states.shape}, "
+            f"encoder_hidden_states(txt)={encoder_hidden_states.shape}"
+        )
+
         seq_len_txt = encoder_hidden_states.shape[1]
 
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
@@ -618,11 +627,26 @@ class QwenImageCrossAttention(nn.Module):
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
 
+        # joint: [B, S_txt + S_img_local, H, head_dim]
+        # 注意: txt 和 cond_full 在所有 rank 上是相同的 (replicated)
+        #       只有 noisy_local 在不同 rank 上是不同的切片
+        logger.info(
+            f"[QwenImageCrossAttention] Joint before USPAttention: "
+            f"joint_query={joint_query.shape} [B, S_txt({seq_len_txt})+S_img_local({img_query.shape[1]}), H, head_dim]"
+        )
+
         # Compute joint attention
         joint_hidden_states = self.attn(
             joint_query,
             joint_key,
             joint_value,
+        )
+
+        # === USPAttention 输出后 ===
+        # joint_hidden_states: [B, S_txt + S_img_local, H, head_dim]
+        logger.info(
+            f"[QwenImageCrossAttention] Joint after USPAttention: "
+            f"joint_hidden_states={joint_hidden_states.shape}"
         )
 
         # Reshape back
@@ -994,6 +1018,16 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         image_rotary_emb = freqs_cis
         for index_block, block in enumerate(self.transformer_blocks):
+            if index_block == 0:
+                logger.info(
+                    f"[Block {index_block}] Input shapes: "
+                    f"hidden_states={hidden_states.shape}, "
+                    f"encoder_hidden_states={encoder_hidden_states.shape}, "
+                    f"temb_img_silu={temb_img_silu.shape}, "
+                    f"temb_txt_silu={temb_txt_silu.shape}, "
+                    f"image_rotary_emb img_cos={image_rotary_emb[0][0].shape if image_rotary_emb else None}, "
+                    f"image_rotary_emb txt_cos={image_rotary_emb[1][0].shape if image_rotary_emb else None}"
+                )
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,

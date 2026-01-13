@@ -359,6 +359,16 @@ class USPAttention(nn.Module):
         ), "USPAttention does not support replicated_qkv."
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+
+        from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+        _logger = init_logger(__name__)
+
+        # === USPAttention 输入 ===
+        _logger.info(
+            f"[USPAttention] Input: q={q.shape} [B, S_local, H, D], "
+            f"ulysses_degree={get_ulysses_parallel_world_size()}"
+        )
+
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
@@ -366,10 +376,19 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S, H_local, D]
+            # [B, S_local, H, D] -> [B, S_global, H_local, D]
+            # S_global = S_local * ulysses_degree
+            # H_local = H / ulysses_degree
             q = _usp_input_all_to_all(q, head_dim=2)
             k = _usp_input_all_to_all(k, head_dim=2)
             v = _usp_input_all_to_all(v, head_dim=2)
+
+            # === All-to-All 后 ===
+            # 注意: 如果输入中有 replicated 的 tokens (如 txt, cond_full),
+            #       它们会在 S_global 中出现 ulysses_degree 次!
+            _logger.info(
+                f"[USPAttention] After input All-to-All: q={q.shape} [B, S_global, H_local, D]"
+            )
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -387,7 +406,12 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S_local, H, D]
+            # [B, S_global, H_local, D] -> [B, S_local, H, D]
             out = _usp_output_all_to_all(out, head_dim=2)
+
+            # === 输出 All-to-All 后 ===
+            _logger.info(
+                f"[USPAttention] After output All-to-All: out={out.shape} [B, S_local, H, D]"
+            )
 
         return out
