@@ -196,23 +196,10 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
 
-        # freqs_cis = self.get_freqs_cis(
-        #     img_shapes, txt_seq_lens, rotary_emb, device, dtype
-        # )
-
-        # img_cache, txt_cache = freqs_cis
-        # img_cache = shard_rotary_emb_for_sp(img_cache)
-        # return {
-        #     "txt_seq_lens": txt_seq_lens,
-        #     "freqs_cis": (img_cache, txt_cache),
-        # }
         (img_cos, img_sin), (txt_cos, txt_sin) = self.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
-        # 标准 Ulysses: img RoPE 要切分
-        # 注意: txt RoPE 不需要再次切分，因为 prompt_embeds 已经被切分了，
-        # txt_seq_lens 已经是 local 长度，get_freqs_cis 生成的 txt RoPE 长度已正确
         img_cos = shard_rotary_emb_for_sp(img_cos)
         img_sin = shard_rotary_emb_for_sp(img_sin)
         return {
@@ -277,27 +264,20 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             ],
         ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
-        # freqs_cis = QwenImagePipelineConfig.get_freqs_cis(
         (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
         )
 
-        # 标准 Ulysses: noisy_img, cond_img 的 RoPE 要切分
-        # 注意: txt RoPE 不需要切分，因为 prompt_embeds 已经被切分了，
-        # txt_seq_lens 已经是 local 长度，get_freqs_cis 生成的 txt RoPE 长度已正确
         noisy_img_seq_len = (
             1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
         )
 
-        # 切分 noisy_img RoPE
         noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
         noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
 
-        # 切分 cond_img RoPE (标准 Ulysses)
         cond_img_cos = shard_rotary_emb_for_sp(img_cos[noisy_img_seq_len:, :])
         cond_img_sin = shard_rotary_emb_for_sp(img_sin[noisy_img_seq_len:, :])
 
-        # 拼接
         img_cos = torch.cat([noisy_img_cos, cond_img_cos], dim=0).to(device=device)
         img_sin = torch.cat([noisy_img_sin, cond_img_sin], dim=0).to(device=device)
 
