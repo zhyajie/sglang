@@ -333,27 +333,26 @@ class PipelineConfig:
 
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
+        # NOTE: Following xDiT approach - we do NOT shard latents here.
+        # All sharding (with padding if needed) will be done at hidden_states
+        # level inside the DiT model. This ensures:
+        # 1. Consistent handling regardless of divisibility
+        # 2. Proper padding/unpadding at the sequence level
+        # 3. Correct output frame count matching user input
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         if latents.dim() != 5:
             return latents, False
         time_dim = latents.shape[2]
 
-        # Pad to next multiple of SP degree if needed
-        if time_dim > 0 and time_dim % sp_world_size != 0:
-            pad_len = sp_world_size - (time_dim % sp_world_size)
-            pad = torch.zeros(
-                (*latents.shape[:2], pad_len, *latents.shape[3:]),
-                dtype=latents.dtype,
-                device=latents.device,
-            )
-            latents = torch.cat([latents, pad], dim=2)
+        # Save original latent time dimension for later reference
+        batch.original_latent_num_frames = time_dim
 
-        assert latents.shape[2] % sp_world_size == 0
-        sharded_tensor = rearrange(
-            latents, "b c (n t) h w -> b c n t h w", n=sp_world_size
-        ).contiguous()
-        sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
-        return sharded_tensor, True
+        # Mark whether padding will be needed at hidden_states level
+        batch.needs_hidden_states_padding = (time_dim % sp_world_size != 0)
+
+        # Always pass full latent to DiT - sharding happens inside DiT
+        # at hidden_states level after patch embedding (xDiT style)
+        return latents, False
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds

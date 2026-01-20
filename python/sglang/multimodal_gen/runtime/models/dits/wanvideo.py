@@ -11,7 +11,11 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_world_size,
+    get_sp_parallel_rank,
+    get_sp_group,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     SparseLinearAttention,
@@ -47,6 +51,147 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+# ============================================================================
+# xDiT/Diffusers-style RoPE for WAN models
+# ============================================================================
+
+def apply_rotary_emb_wan(
+    hidden_states: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply rotary embeddings using xDiT/Diffusers style.
+    
+    Args:
+        hidden_states: [batch, seq_len, num_heads, head_dim]
+        freqs_cos: [1, seq_len, 1, head_dim] (with repeat_interleave)
+        freqs_sin: [1, seq_len, 1, head_dim] (with repeat_interleave)
+    
+    Returns:
+        Tensor with rotary embeddings applied
+    """
+    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+    cos = freqs_cos[..., 0::2]
+    sin = freqs_sin[..., 1::2]
+    out = torch.empty_like(hidden_states)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out.type_as(hidden_states)
+
+
+class WanRotaryPosEmbed(nn.Module):
+    """
+    xDiT/Diffusers-style Rotary position embeddings for WAN 3D video data.
+    Lazy initialization to avoid meta device issues with FSDP.
+    """
+
+    def __init__(
+        self,
+        attention_head_dim: int,
+        patch_size: tuple[int, int, int],
+        max_seq_len: int = 1024,
+        theta: float = 10000.0,
+    ):
+        super().__init__()
+
+        self.attention_head_dim = attention_head_dim
+        self.patch_size = patch_size
+        self.max_seq_len = max_seq_len
+        self.theta = theta
+        
+        # Lazy initialization - tensors will be created on first forward call
+        self._freqs_cos = None
+        self._freqs_sin = None
+        self._initialized_device = None
+
+    def _initialize_freqs(self, device: torch.device):
+        """Lazily initialize frequency tensors on the target device."""
+        if self._initialized_device == device:
+            return
+            
+        # Split dimensions for temporal, height, width (same as Diffusers)
+        h_dim = w_dim = 2 * (self.attention_head_dim // 6)
+        t_dim = self.attention_head_dim - h_dim - w_dim
+        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+
+        freqs_cos_list = []
+        freqs_sin_list = []
+
+        for dim in [t_dim, h_dim, w_dim]:
+            freq_cos, freq_sin = self._get_1d_rotary_pos_embed(dim, self.max_seq_len, self.theta, freqs_dtype, device)
+            freqs_cos_list.append(freq_cos)
+            freqs_sin_list.append(freq_sin)
+
+        self._freqs_cos = torch.cat(freqs_cos_list, dim=1)
+        self._freqs_sin = torch.cat(freqs_sin_list, dim=1)
+        self._initialized_device = device
+
+    @staticmethod
+    def _get_1d_rotary_pos_embed(
+        dim: int,
+        max_seq_len: int,
+        theta: float,
+        freqs_dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate 1D rotary position embeddings with repeat_interleave."""
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=device) / dim))
+        t = torch.arange(max_seq_len, dtype=freqs_dtype, device=device)
+        freqs = torch.outer(t, freqs)
+        # Repeat interleave for real representation (key difference from SGLang's NDRotaryEmbedding)
+        freqs_cos = freqs.cos().repeat_interleave(2, dim=-1)
+        freqs_sin = freqs.sin().repeat_interleave(2, dim=-1)
+        return freqs_cos.float(), freqs_sin.float()
+
+    def forward(
+        self,
+        num_frames: int,
+        height: int,
+        width: int,
+        device: torch.device = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate 4D RoPE for the given video dimensions.
+        
+        Returns:
+            freqs_cos: [1, seq_len, 1, head_dim]
+            freqs_sin: [1, seq_len, 1, head_dim]
+        """
+        # Lazy initialization on first call
+        self._initialize_freqs(device)
+
+        p_t, p_h, p_w = self.patch_size
+        ppf = num_frames // p_t
+        pph = height // p_h
+        ppw = width // p_w
+
+        # Split sizes must match the dimension split in _initialize_freqs
+        # h_dim = w_dim = 2 * (attention_head_dim // 6)
+        # t_dim = attention_head_dim - h_dim - w_dim
+        h_dim = w_dim = 2 * (self.attention_head_dim // 6)
+        t_dim = self.attention_head_dim - h_dim - w_dim
+        split_sizes = [t_dim, h_dim, w_dim]
+
+        freqs_cos = self._freqs_cos.split(split_sizes, dim=1)
+        freqs_sin = self._freqs_sin.split(split_sizes, dim=1)
+
+        # Expand each dimension
+        freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_cos_w = freqs_cos[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        freqs_sin_f = freqs_sin[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_h = freqs_sin[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
+        freqs_sin_w = freqs_sin[2][:ppw].view(1, 1, ppw, -1).expand(ppf, pph, ppw, -1)
+
+        # Concatenate and reshape to [1, seq_len, 1, head_dim]
+        freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+        freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
+
+        return freqs_cos, freqs_sin
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -397,11 +542,10 @@ class WanTransformerBlock(nn.Module):
         key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
         value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
 
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        # Apply rotary embeddings (xDiT/Diffusers style)
+        freqs_cos, freqs_sin = freqs_cis
+        query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
+        key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
@@ -565,11 +709,10 @@ class WanTransformerBlock_VSA(nn.Module):
             2, (self.num_attention_heads, -1)
         )
 
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        query, key = _apply_rotary_emb(
-            query, cos, sin, is_neox_style=False
-        ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+        # Apply rotary embeddings (xDiT/Diffusers style)
+        freqs_cos, freqs_sin = freqs_cis
+        query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
+        key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
@@ -698,17 +841,60 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # misc
         self.sp_size = get_sp_world_size()
 
-        # Get rotary embeddings
+        # Get rotary embeddings (xDiT/Diffusers style)
         d = self.hidden_size // self.num_attention_heads
-        self.rope_dim_list = [d - 4 * (d // 6), 2 * (d // 6), 2 * (d // 6)]
-
-        self.rotary_emb = NDRotaryEmbedding(
-            rope_dim_list=self.rope_dim_list,
-            rope_theta=10000,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+        self.rotary_emb = WanRotaryPosEmbed(
+            attention_head_dim=d,
+            patch_size=self.patch_size,
+            max_seq_len=1024,  # Same as Diffusers default
+            theta=10000.0,
         )
 
         self.layer_names = ["blocks"]
+
+    @torch.compiler.disable
+    def _generate_rope_embeddings(
+        self,
+        num_frames: int,
+        height: int,
+        width: int,
+        seq_pad_amount: int,
+        sp_world_size: int,
+        sp_rank: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Generate RoPE embeddings using xDiT/Diffusers style with padding and chunking
+        for sequence parallelism.
+        
+        Disabled from torch.compile due to dynamic tensor creation in lazy initialization.
+        
+        Returns:
+            freqs_cos, freqs_sin: [1, chunk_seq_len, 1, head_dim]
+        """
+        # Generate full RoPE using xDiT/Diffusers style
+        # Output shape: [1, seq_len, 1, head_dim]
+        freqs_cos, freqs_sin = self.rotary_emb(num_frames, height, width, device=device)
+
+        # Pad RoPE with zeros (xDiT style - padding tokens get zero RoPE)
+        # Shape after pad: [1, seq_len + pad, 1, head_dim]
+        if seq_pad_amount > 0:
+            freqs_cos = torch.cat([
+                freqs_cos,
+                torch.zeros(1, seq_pad_amount, 1, freqs_cos.shape[3], device=device, dtype=freqs_cos.dtype)
+            ], dim=1)
+            freqs_sin = torch.cat([
+                freqs_sin,
+                torch.zeros(1, seq_pad_amount, 1, freqs_sin.shape[3], device=device, dtype=freqs_sin.dtype)
+            ], dim=1)
+
+        # Chunk RoPE for SP along seq_len dimension
+        # Shape after chunk: [1, chunk_seq_len, 1, head_dim]
+        if sp_world_size > 1:
+            freqs_cos = torch.chunk(freqs_cos, sp_world_size, dim=1)[sp_rank]
+            freqs_sin = torch.chunk(freqs_sin, sp_world_size, dim=1)[sp_rank]
+
+        return freqs_cos, freqs_sin
 
     def forward(
         self,
@@ -740,25 +926,46 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        # The rotary embedding layer correctly handles SP offsets internally.
-        freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
-            (
-                post_patch_num_frames * self.sp_size,
-                post_patch_height,
-                post_patch_width,
-            ),
-            shard_dim=0,
-            start_frame=0,
-            device=hidden_states.device,
-        )
-        assert freqs_cos.dtype == torch.float32
-        assert freqs_cos.device == hidden_states.device
-        freqs_cis = (
-            (freqs_cos.float(), freqs_sin.float()) if freqs_cos is not None else None
+        # === xDiT-style sequence parallel handling ===
+        # Padding is done at seq_len level, NOT frame level
+        sp_world_size = self.sp_size
+        sp_rank = get_sp_parallel_rank() if sp_world_size > 1 else 0
+
+        # Calculate original sequence length
+        original_seq_len = post_patch_num_frames * post_patch_height * post_patch_width
+
+        # Calculate padded sequence length (divisible by sp_world_size)
+        if sp_world_size > 1 and original_seq_len % sp_world_size != 0:
+            padded_seq_len = int(math.ceil(original_seq_len / sp_world_size)) * sp_world_size
+            seq_pad_amount = padded_seq_len - original_seq_len
+        else:
+            padded_seq_len = original_seq_len
+            seq_pad_amount = 0
+
+        # Generate RoPE using xDiT/Diffusers style
+        # Pass original dimensions (before patching), the method handles patch_size internally
+        freqs_cis = self._generate_rope_embeddings(
+            num_frames, height, width,
+            seq_pad_amount, sp_world_size, sp_rank, hidden_states.device
         )
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+        # Pad hidden_states at seq_len level (xDiT style)
+        if seq_pad_amount > 0:
+            hidden_states = torch.cat([
+                hidden_states,
+                torch.zeros(
+                    batch_size, seq_pad_amount, hidden_states.shape[2],
+                    device=hidden_states.device, dtype=hidden_states.dtype
+                )
+            ], dim=1)
+
+        # Chunk hidden_states for SP
+        if sp_world_size > 1:
+            hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
             # ti2v
@@ -778,14 +985,44 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         if ts_seq_len is not None:
             # batch_size, seq_len, 6, inner_dim
             timestep_proj = timestep_proj.unflatten(2, (6, -1))
+
+            # For ti2v: pad and chunk temb and timestep_proj
+            if sp_world_size > 1:
+                # Pad temb: [batch_size, seq_len, inner_dim]
+                if seq_pad_amount > 0:
+                    temb = torch.cat([
+                        temb,
+                        torch.zeros(
+                            batch_size, seq_pad_amount, temb.shape[2],
+                            device=temb.device, dtype=temb.dtype
+                        )
+                    ], dim=1)
+                    # Pad timestep_proj: [batch_size, seq_len, 6, inner_dim]
+                    timestep_proj = torch.cat([
+                        timestep_proj,
+                        torch.zeros(
+                            batch_size, seq_pad_amount, timestep_proj.shape[2], timestep_proj.shape[3],
+                            device=timestep_proj.device, dtype=timestep_proj.dtype
+                        )
+                    ], dim=1)
+                # Chunk temb and timestep_proj
+                temb = torch.chunk(temb, sp_world_size, dim=1)[sp_rank]
+                timestep_proj = torch.chunk(timestep_proj, sp_world_size, dim=1)[sp_rank]
         else:
             # batch_size, 6, inner_dim
             timestep_proj = timestep_proj.unflatten(1, (6, -1))
 
         if encoder_hidden_states_image is not None:
+            # Wan2.1: cross attention with image embeddings - don't chunk
             encoder_hidden_states = torch.concat(
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
+        else:
+            # Wan2.1 T2V or other modes: chunk encoder_hidden_states for SP
+            if sp_world_size > 1:
+                encoder_hidden_states = torch.chunk(
+                    encoder_hidden_states, sp_world_size, dim=-2
+                )[sp_rank]
 
         encoder_hidden_states = (
             encoder_hidden_states.to(orig_dtype)
@@ -829,6 +1066,17 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
         hidden_states = self.proj_out(hidden_states)
+
+        # === xDiT-style all_gather and unpad ===
+        # Gather hidden_states from all SP ranks
+        if sp_world_size > 1:
+            sp_group = get_sp_group()
+            hidden_states = sp_group.all_gather(hidden_states, dim=-2)
+
+        # Remove padding to get back to original sequence length (xDiT style)
+        # Use the product of post_patch dimensions as the target length
+        original_seq_len = post_patch_num_frames * post_patch_height * post_patch_width
+        hidden_states = hidden_states[:, :original_seq_len, :]
 
         hidden_states = hidden_states.reshape(
             batch_size,
