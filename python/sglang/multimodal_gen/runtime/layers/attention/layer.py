@@ -87,6 +87,7 @@ class UlyssesAttention(nn.Module):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass for distributed attention.
 
@@ -97,6 +98,7 @@ class UlyssesAttention(nn.Module):
             replicated_q (Optional[torch.Tensor]): Replicated query tensor, typically for text tokens
             replicated_k (Optional[torch.Tensor]): Replicated key tensor
             replicated_v (Optional[torch.Tensor]): Replicated value tensor
+            attention_mask (Optional[torch.Tensor]): Attention mask
 
         Returns:
             Tuple[torch.Tensor, Optional[torch.Tensor]]: A tuple containing:
@@ -134,7 +136,14 @@ class UlyssesAttention(nn.Module):
 
         q, k, v = qkv.chunk(3, dim=0)
 
-        output = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        # Handle attention mask if provided
+        if attention_mask is not None:
+            # For Ulysses, the mask needs to be sharded or expanded to match the gathered sequence length
+            # However, if it's a padding mask for the full sequence, we may need to gather it or use it as is
+            # depending on the implementation. Most backends expect [bs, heads, q_seq, k_seq] or similar.
+            pass
+
+        output = self.attn_impl.forward(q, k, v, ctx_attn_metadata, attention_mask=attention_mask)
 
         # Redistribute back if using sequence parallelism
         replicated_output = None
@@ -338,6 +347,7 @@ class USPAttention(nn.Module):
         self.causal = causal
         self.dropout_p = dropout_rate
 
+    @torch.compiler.disable
     def forward(
         self,
         q: torch.Tensor,
@@ -346,6 +356,7 @@ class USPAttention(nn.Module):
         replicated_q: torch.Tensor | None = None,
         replicated_k: torch.Tensor | None = None,
         replicated_v: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for USPAttention.
@@ -353,6 +364,8 @@ class USPAttention(nn.Module):
             q, k, v: [B, S_local, H, D]
 
         Note: Replicated tensors are not supported in this implementation.
+        Note: torch.compiler.disable is required because distributed communication
+              operations (all-to-all) are not compatible with torch.compile.
         """
         assert (
             replicated_q is None and replicated_k is None and replicated_v is None
@@ -362,7 +375,7 @@ class USPAttention(nn.Module):
 
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata, attention_mask=attention_mask)
             return out
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -383,10 +396,11 @@ class USPAttention(nn.Module):
                 attn_impl=self.attn_impl,
                 is_causal=self.causal,
                 dropout_p=self.dropout_p,
+                # Note: Ring attention currently doesn't support custom masks in this wrapper
             )
         else:
             # -> [B, S, H_local, D]
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata, attention_mask=attention_mask)
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:

@@ -63,7 +63,7 @@ def apply_rotary_emb_wan(
     freqs_sin: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Apply rotary embeddings using xDiT/Diffusers style.
+    Apply rotary embeddings using xDiT/Diffusers style (exactly matching xDiT implementation).
     
     Args:
         hidden_states: [batch, seq_len, num_heads, head_dim]
@@ -73,14 +73,17 @@ def apply_rotary_emb_wan(
     Returns:
         Tensor with rotary embeddings applied
     """
-    x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+    # xDiT exact implementation style, but made more torch.compile friendly
+    x1 = hidden_states[..., 0::2]
+    x2 = hidden_states[..., 1::2]
     cos = freqs_cos[..., 0::2]
     sin = freqs_sin[..., 1::2]
     
-    # Use stack and flatten instead of slice assignment for better torch.compile fusion
-    out_even = x1 * cos - x2 * sin
-    out_odd = x1 * sin + x2 * cos
-    out = torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+    out1 = x1 * cos - x2 * sin
+    out2 = x1 * sin + x2 * cos
+    
+    # Interleave out1 and out2
+    out = torch.stack([out1, out2], dim=-1).flatten(-2)
     return out.to(hidden_states.dtype)
 
 
@@ -128,8 +131,8 @@ class WanRotaryPosEmbed(nn.Module):
             self._init_freqs_directly()
         else:
             # Lazy initialization for FSDP compatibility
-            self._freqs_cos = None
-            self._freqs_sin = None
+            self.register_buffer("freqs_cos", None, persistent=False)
+            self.register_buffer("freqs_sin", None, persistent=False)
             self._initialized_device = None
 
     def _init_freqs_directly(self):
@@ -187,8 +190,8 @@ class WanRotaryPosEmbed(nn.Module):
             freqs_cos_list.append(freq_cos)
             freqs_sin_list.append(freq_sin)
 
-        self._freqs_cos = torch.cat(freqs_cos_list, dim=1)
-        self._freqs_sin = torch.cat(freqs_sin_list, dim=1)
+        self.freqs_cos = torch.cat(freqs_cos_list, dim=1)
+        self.freqs_sin = torch.cat(freqs_sin_list, dim=1)
         self._initialized_device = device
 
     @staticmethod
@@ -225,19 +228,17 @@ class WanRotaryPosEmbed(nn.Module):
         if self._use_lazy_init:
             # Lazy initialization mode (FSDP)
             self._initialize_freqs_lazy(device)
-            freqs_cos_base = self._freqs_cos
-            freqs_sin_base = self._freqs_sin
+            freqs_cos_base = self.freqs_cos
+            freqs_sin_base = self.freqs_sin
         else:
             # Direct initialization mode (xDiT style)
             freqs_cos_base = self.freqs_cos
             freqs_sin_base = self.freqs_sin
-            # Move buffers to correct device on first call if needed
+            # NOTE: We do NOT assign back to self.freqs_cos here to avoid torch.compile issues.
+            # The model should be moved to device before compilation if use_meta_device=False.
             if freqs_cos_base.device != device:
-                # Update the registered buffers to avoid repeated moves
-                self.freqs_cos = self.freqs_cos.to(device)
-                self.freqs_sin = self.freqs_sin.to(device)
-                freqs_cos_base = self.freqs_cos
-                freqs_sin_base = self.freqs_sin
+                freqs_cos_base = freqs_cos_base.to(device)
+                freqs_sin_base = freqs_sin_base.to(device)
 
         p_t, p_h, p_w = self.patch_size
         ppf = num_frames // p_t
@@ -574,6 +575,7 @@ class WanTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -620,7 +622,7 @@ class WanTransformerBlock(nn.Module):
         freqs_cos, freqs_sin = freqs_cis
         query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
         key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
-        attn_output = self.attn1(query, key, value)
+        attn_output = self.attn1(query, key, value, attention_mask=attention_mask)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
 
@@ -750,6 +752,7 @@ class WanTransformerBlock_VSA(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -788,7 +791,7 @@ class WanTransformerBlock_VSA(nn.Module):
         query = apply_rotary_emb_wan(query, freqs_cos, freqs_sin)
         key = apply_rotary_emb_wan(key, freqs_cos, freqs_sin)
 
-        attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
+        attn_output = self.attn1(query, key, value, gate_compress=gate_compress, attention_mask=attention_mask)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
 
@@ -952,12 +955,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # Output shape: [1, seq_len, 1, head_dim]
         freqs_cos, freqs_sin = self.rotary_emb(num_frames, height, width, device=device)
 
-        # Pad RoPE (xDiT style - padding tokens get identity RoPE)
-        # cos=1, sin=0 ensures padding tokens are not rotated
+        # Pad RoPE (xDiT style - use zeros for both cos and sin)
+        # This matches xDiT exactly: padding positions get zero-ed out after RoPE
         if seq_pad_amount > 0:
             freqs_cos = torch.cat([
                 freqs_cos,
-                torch.ones(1, seq_pad_amount, 1, freqs_cos.shape[3], device=device, dtype=freqs_cos.dtype)
+                torch.zeros(1, seq_pad_amount, 1, freqs_cos.shape[3], device=device, dtype=freqs_cos.dtype)
             ], dim=1)
             freqs_sin = torch.cat([
                 freqs_sin,
@@ -1042,6 +1045,18 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         if sp_world_size > 1:
             hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
 
+        # === Create attention mask for padding tokens ===
+        # The mask needs to be applied after Ulysses AllToAll (to the global sequence)
+        attention_mask = None
+        if seq_pad_amount > 0:
+            # Mask shape: [batch_size, 1, 1, padded_seq_len]
+            # 1 for real tokens, 0 for padded tokens
+            # Using float mask for SDPA compatibility (0 for keep, -inf for mask)
+            # or boolean mask (True for keep, False for mask)
+            mask = torch.ones((batch_size, 1, 1, padded_seq_len), device=hidden_states.device, dtype=torch.bool)
+            mask[:, :, :, original_seq_len:] = False
+            attention_mask = mask
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
             # ti2v
@@ -1124,7 +1139,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
             for block in self.blocks:
                 hidden_states = block(
-                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
+                    hidden_states, encoder_hidden_states, timestep_proj, freqs_cis,
+                    attention_mask=attention_mask
                 )
             # if teacache is enabled, we need to cache the original hidden states
             if enable_teacache:

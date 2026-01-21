@@ -58,13 +58,14 @@ class SDPAImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # transpose to bs, heads, seq_len, head_dim
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
         attn_kwargs = {
-            "attn_mask": None,
+            "attn_mask": attention_mask,
             "dropout_p": self.dropout,
             "is_causal": self.causal,
             "scale": self.softmax_scale,

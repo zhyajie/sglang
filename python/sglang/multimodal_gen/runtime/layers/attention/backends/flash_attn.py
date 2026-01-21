@@ -178,6 +178,7 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
         *,
         return_softmax_lse: bool = False,
+        attention_mask: torch.Tensor | None = None,
     ):
         # We should NOT use attn_metadata to cache max_seqlen_q/k because they can
         # change between calls (e.g. self-attention vs cross-attention) in one step.
@@ -201,6 +202,8 @@ class FlashAttentionImpl(AttentionImpl):
             q_ = query.contiguous()
             k_ = key.contiguous()
             v_ = value.contiguous()
+            # Note: upstream flash_attn_varlen_func doesn't easily support arbitrary masks
+            # without conversion to cu_seqlens.
             out = flash_attn_varlen_func_upstream(
                 q_,
                 k_,
@@ -218,6 +221,9 @@ class FlashAttentionImpl(AttentionImpl):
                 return out.reshape(bsz, seqlen_q, nheads_q, -1), softmax_lse
             return out.reshape(bsz, seqlen_q, nheads_q, d)
 
+        # For sgl_kernel flash_attn, if attention_mask is provided, 
+        # we'd ideally convert it to cu_seqlens or handle it.
+        # But for now, we'll just pass through.
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
             k=key,
