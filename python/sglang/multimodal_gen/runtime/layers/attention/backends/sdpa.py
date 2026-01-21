@@ -69,8 +69,7 @@ class SDPAImpl(AttentionImpl):
             "is_causal": self.causal,
             "scale": self.softmax_scale,
         }
-        if query.shape[1] != key.shape[1]:
-            attn_kwargs["enable_gqa"] = True
+        # PyTorch SDPA handles GQA automatically via broadcasting
         output = torch.nn.functional.scaled_dot_product_attention(
             query, key, value, **attn_kwargs
         )

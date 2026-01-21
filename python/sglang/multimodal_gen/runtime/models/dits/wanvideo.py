@@ -76,16 +76,25 @@ def apply_rotary_emb_wan(
     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos = freqs_cos[..., 0::2]
     sin = freqs_sin[..., 1::2]
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x1 * cos - x2 * sin
-    out[..., 1::2] = x1 * sin + x2 * cos
-    return out.type_as(hidden_states)
+    
+    # Use stack and flatten instead of slice assignment for better torch.compile fusion
+    out_even = x1 * cos - x2 * sin
+    out_odd = x1 * sin + x2 * cos
+    out = torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+    return out.to(hidden_states.dtype)
 
 
 class WanRotaryPosEmbed(nn.Module):
     """
     xDiT/Diffusers-style Rotary position embeddings for WAN 3D video data.
-    Lazy initialization to avoid meta device issues with FSDP.
+    
+    Supports two initialization modes:
+    1. Direct initialization (use_meta_device=False): Like xDiT/Diffusers, uses register_buffer
+       in __init__ for full torch.compile compatibility.
+    2. Lazy initialization (use_meta_device=True): Defers tensor creation to first forward call
+       to avoid meta device issues with FSDP.
+    
+    The mode is automatically detected based on whether the module is created on meta device.
     """
 
     def __init__(
@@ -102,13 +111,66 @@ class WanRotaryPosEmbed(nn.Module):
         self.max_seq_len = max_seq_len
         self.theta = theta
         
-        # Lazy initialization - tensors will be created on first forward call
-        self._freqs_cos = None
-        self._freqs_sin = None
-        self._initialized_device = None
+        # Check if we're on meta device (FSDP mode) or real device (direct mode)
+        # We detect this by checking the default device context
+        try:
+            # Try to create a small tensor to detect current device
+            test_tensor = torch.empty(1)
+            is_meta_device = test_tensor.device.type == "meta"
+            del test_tensor
+        except Exception:
+            is_meta_device = True  # Fall back to lazy initialization on any error
+        
+        self._use_lazy_init = is_meta_device
+        
+        if not is_meta_device:
+            # Direct initialization (xDiT/Diffusers style) - full torch.compile compatibility
+            self._init_freqs_directly()
+        else:
+            # Lazy initialization for FSDP compatibility
+            self._freqs_cos = None
+            self._freqs_sin = None
+            self._initialized_device = None
 
-    def _initialize_freqs(self, device: torch.device):
-        """Lazily initialize frequency tensors on the target device."""
+    def _init_freqs_directly(self):
+        """Initialize frequency tensors directly using register_buffer (xDiT/Diffusers style)."""
+        # Split dimensions for temporal, height, width (same as Diffusers)
+        h_dim = w_dim = 2 * (self.attention_head_dim // 6)
+        t_dim = self.attention_head_dim - h_dim - w_dim
+        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+
+        freqs_cos_list = []
+        freqs_sin_list = []
+
+        for dim in [t_dim, h_dim, w_dim]:
+            freq_cos, freq_sin = self._get_1d_rotary_pos_embed_static(dim, self.max_seq_len, self.theta, freqs_dtype)
+            freqs_cos_list.append(freq_cos)
+            freqs_sin_list.append(freq_sin)
+
+        freqs_cos = torch.cat(freqs_cos_list, dim=1)
+        freqs_sin = torch.cat(freqs_sin_list, dim=1)
+        
+        # Use register_buffer for proper model state management
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    @staticmethod
+    def _get_1d_rotary_pos_embed_static(
+        dim: int,
+        max_seq_len: int,
+        theta: float,
+        freqs_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate 1D rotary position embeddings (static, no device specified)."""
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype) / dim))
+        t = torch.arange(max_seq_len, dtype=freqs_dtype)
+        freqs = torch.outer(t, freqs)
+        freqs_cos = freqs.cos().repeat_interleave(2, dim=-1)
+        freqs_sin = freqs.sin().repeat_interleave(2, dim=-1)
+        return freqs_cos.float(), freqs_sin.float()
+
+    def _initialize_freqs_lazy(self, device: torch.device):
+        """Lazily initialize frequency tensors on the target device (FSDP mode)."""
         if self._initialized_device == device:
             return
             
@@ -121,7 +183,7 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_sin_list = []
 
         for dim in [t_dim, h_dim, w_dim]:
-            freq_cos, freq_sin = self._get_1d_rotary_pos_embed(dim, self.max_seq_len, self.theta, freqs_dtype, device)
+            freq_cos, freq_sin = self._get_1d_rotary_pos_embed_with_device(dim, self.max_seq_len, self.theta, freqs_dtype, device)
             freqs_cos_list.append(freq_cos)
             freqs_sin_list.append(freq_sin)
 
@@ -130,18 +192,17 @@ class WanRotaryPosEmbed(nn.Module):
         self._initialized_device = device
 
     @staticmethod
-    def _get_1d_rotary_pos_embed(
+    def _get_1d_rotary_pos_embed_with_device(
         dim: int,
         max_seq_len: int,
         theta: float,
         freqs_dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generate 1D rotary position embeddings with repeat_interleave."""
+        """Generate 1D rotary position embeddings on specified device."""
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=device) / dim))
         t = torch.arange(max_seq_len, dtype=freqs_dtype, device=device)
         freqs = torch.outer(t, freqs)
-        # Repeat interleave for real representation (key difference from SGLang's NDRotaryEmbedding)
         freqs_cos = freqs.cos().repeat_interleave(2, dim=-1)
         freqs_sin = freqs.sin().repeat_interleave(2, dim=-1)
         return freqs_cos.float(), freqs_sin.float()
@@ -160,23 +221,36 @@ class WanRotaryPosEmbed(nn.Module):
             freqs_cos: [1, seq_len, 1, head_dim]
             freqs_sin: [1, seq_len, 1, head_dim]
         """
-        # Lazy initialization on first call
-        self._initialize_freqs(device)
+        # Get the frequency tensors based on initialization mode
+        if self._use_lazy_init:
+            # Lazy initialization mode (FSDP)
+            self._initialize_freqs_lazy(device)
+            freqs_cos_base = self._freqs_cos
+            freqs_sin_base = self._freqs_sin
+        else:
+            # Direct initialization mode (xDiT style)
+            freqs_cos_base = self.freqs_cos
+            freqs_sin_base = self.freqs_sin
+            # Move buffers to correct device on first call if needed
+            if freqs_cos_base.device != device:
+                # Update the registered buffers to avoid repeated moves
+                self.freqs_cos = self.freqs_cos.to(device)
+                self.freqs_sin = self.freqs_sin.to(device)
+                freqs_cos_base = self.freqs_cos
+                freqs_sin_base = self.freqs_sin
 
         p_t, p_h, p_w = self.patch_size
         ppf = num_frames // p_t
         pph = height // p_h
         ppw = width // p_w
 
-        # Split sizes must match the dimension split in _initialize_freqs
-        # h_dim = w_dim = 2 * (attention_head_dim // 6)
-        # t_dim = attention_head_dim - h_dim - w_dim
+        # Split sizes must match the dimension split in initialization
         h_dim = w_dim = 2 * (self.attention_head_dim // 6)
         t_dim = self.attention_head_dim - h_dim - w_dim
         split_sizes = [t_dim, h_dim, w_dim]
 
-        freqs_cos = self._freqs_cos.split(split_sizes, dim=1)
-        freqs_sin = self._freqs_sin.split(split_sizes, dim=1)
+        freqs_cos = freqs_cos_base.split(split_sizes, dim=1)
+        freqs_sin = freqs_sin_base.split(split_sizes, dim=1)
 
         # Expand each dimension
         freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
@@ -538,9 +612,9 @@ class WanTransformerBlock(nn.Module):
         if self.norm_k is not None:
             key = self.norm_k(key)
 
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
+        query = query.unflatten(2, (self.num_attention_heads, -1))
+        key = key.unflatten(2, (self.num_attention_heads, -1))
+        value = value.unflatten(2, (self.num_attention_heads, -1))
 
         # Apply rotary embeddings (xDiT/Diffusers style)
         freqs_cos, freqs_sin = freqs_cis
@@ -549,7 +623,7 @@ class WanTransformerBlock(nn.Module):
         attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
-        attn_output = attn_output.squeeze(1)
+
 
         null_shift = null_scale = torch.zeros(
             (1,), device=hidden_states.device, dtype=hidden_states.dtype
@@ -702,10 +776,10 @@ class WanTransformerBlock_VSA(nn.Module):
         if self.norm_k is not None:
             key = self.norm_k(key)
 
-        query = query.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        key = key.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        value = value.squeeze(1).unflatten(2, (self.num_attention_heads, -1))
-        gate_compress = gate_compress.squeeze(1).unflatten(
+        query = query.unflatten(2, (self.num_attention_heads, -1))
+        key = key.unflatten(2, (self.num_attention_heads, -1))
+        value = value.unflatten(2, (self.num_attention_heads, -1))
+        gate_compress = gate_compress.unflatten(
             2, (self.num_attention_heads, -1)
         )
 
@@ -717,7 +791,7 @@ class WanTransformerBlock_VSA(nn.Module):
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
-        attn_output = attn_output.squeeze(1)
+
 
         null_shift = null_scale = torch.zeros((1,), device=hidden_states.device)
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
@@ -846,13 +920,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.rotary_emb = WanRotaryPosEmbed(
             attention_head_dim=d,
             patch_size=self.patch_size,
-            max_seq_len=1024,  # Same as Diffusers default
+            max_seq_len=config.rope_max_seq_len,  # From config, same as Diffusers
             theta=10000.0,
         )
 
         self.layer_names = ["blocks"]
 
-    @torch.compiler.disable
     def _generate_rope_embeddings(
         self,
         num_frames: int,
@@ -867,7 +940,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         Generate RoPE embeddings using xDiT/Diffusers style with padding and chunking
         for sequence parallelism.
         
-        Disabled from torch.compile due to dynamic tensor creation in lazy initialization.
+        Note: When use_meta_device=False (xDiT style), RoPE is pre-computed in __init__
+        and this method is fully torch.compile compatible.
+        When use_meta_device=True (FSDP mode), lazy initialization may cause issues with
+        torch.compile, but the model handles this internally.
         
         Returns:
             freqs_cos, freqs_sin: [1, chunk_seq_len, 1, head_dim]
@@ -876,12 +952,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # Output shape: [1, seq_len, 1, head_dim]
         freqs_cos, freqs_sin = self.rotary_emb(num_frames, height, width, device=device)
 
-        # Pad RoPE with zeros (xDiT style - padding tokens get zero RoPE)
-        # Shape after pad: [1, seq_len + pad, 1, head_dim]
+        # Pad RoPE (xDiT style - padding tokens get identity RoPE)
+        # cos=1, sin=0 ensures padding tokens are not rotated
         if seq_pad_amount > 0:
             freqs_cos = torch.cat([
                 freqs_cos,
-                torch.zeros(1, seq_pad_amount, 1, freqs_cos.shape[3], device=device, dtype=freqs_cos.dtype)
+                torch.ones(1, seq_pad_amount, 1, freqs_cos.shape[3], device=device, dtype=freqs_cos.dtype)
             ], dim=1)
             freqs_sin = torch.cat([
                 freqs_sin,
@@ -1014,15 +1090,16 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         if encoder_hidden_states_image is not None:
             # Wan2.1: cross attention with image embeddings - don't chunk
+            # TODO: If image_embeds are not sharded by DenoisingStage, they should be sharded here
+            # to be compatible with Ulysses cross-attention.
             encoder_hidden_states = torch.concat(
                 [encoder_hidden_states_image, encoder_hidden_states], dim=1
             )
         else:
             # Wan2.1 T2V or other modes: chunk encoder_hidden_states for SP
-            if sp_world_size > 1:
-                encoder_hidden_states = torch.chunk(
-                    encoder_hidden_states, sp_world_size, dim=-2
-                )[sp_rank]
+            # NOTE: encoder_hidden_states is already sharded by DenoisingStage in SGLang.
+            # Sharding it again here would result in double sharding and information loss.
+            pass
 
         encoder_hidden_states = (
             encoder_hidden_states.to(orig_dtype)

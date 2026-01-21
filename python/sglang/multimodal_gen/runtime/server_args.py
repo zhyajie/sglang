@@ -283,6 +283,7 @@ class ServerArgs:
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
+    use_meta_device: bool = True  # If False, initialize model directly on GPU (xDiT style, needs more VRAM)
     pin_cpu_memory: bool = True
 
     # STA (Sliding Tile Attention) parameters
@@ -600,6 +601,15 @@ class ServerArgs:
             "--use-fsdp-inference",
             action=StoreBoolean,
             help="Use FSDP for inference by sharding the model weights. Latency is very low due to prefetch--enable if run out of memory.",
+        )
+        parser.add_argument(
+            "--use-meta-device",
+            action=StoreBoolean,
+            default=True,
+            help="If True (default), initialize model on meta device for memory efficiency. "
+            "If False, initialize model directly on GPU (xDiT/Diffusers style), which requires "
+            "more VRAM but allows register_buffer in __init__ to work properly, enabling better "
+            "torch.compile compatibility.",
         )
         parser.add_argument(
             "--text-encoder-cpu-offload",

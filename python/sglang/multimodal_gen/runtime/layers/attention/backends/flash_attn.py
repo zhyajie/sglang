@@ -179,15 +179,11 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
-            max_seqlen_q = attn_metadata.max_seqlen_q
-            max_seqlen_k = attn_metadata.max_seqlen_k
-        else:
-            max_seqlen_q = query.shape[1]
-            max_seqlen_k = key.shape[1]
+        # We should NOT use attn_metadata to cache max_seqlen_q/k because they can
+        # change between calls (e.g. self-attention vs cross-attention) in one step.
+        max_seqlen_q = query.shape[1]
+        max_seqlen_k = key.shape[1]
+        
         q_shape = tuple(query.shape)
         k_shape = tuple(key.shape)
         v_shape = tuple(value.shape)
@@ -200,7 +196,8 @@ class FlashAttentionImpl(AttentionImpl):
         )
 
         if use_upstream:
-            bsz, seqlen, nheads_q, d = q_shape
+            bsz, seqlen_q, nheads_q, d = q_shape
+            _, seqlen_k, _, _ = k_shape
             q_ = query.contiguous()
             k_ = key.contiguous()
             v_ = value.contiguous()
@@ -210,16 +207,16 @@ class FlashAttentionImpl(AttentionImpl):
                 v_,
                 None,
                 None,
-                seqlen,
-                seqlen,
+                seqlen_q,
+                seqlen_k,
                 softmax_scale=self.softmax_scale,
                 causal=self.causal,
                 return_attn_probs=return_softmax_lse,
             )
             if return_softmax_lse:
                 out, softmax_lse = out
-                return out.reshape(bsz, seqlen, nheads_q, -1), softmax_lse
-            return out.reshape(bsz, seqlen, nheads_q, d)
+                return out.reshape(bsz, seqlen_q, nheads_q, -1), softmax_lse
+            return out.reshape(bsz, seqlen_q, nheads_q, d)
 
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]

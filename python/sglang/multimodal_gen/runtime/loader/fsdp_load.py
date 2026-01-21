@@ -80,9 +80,16 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
+    use_meta_device: bool = True,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
+    
+    Args:
+        use_meta_device: If True (default), initialize model on meta device for memory efficiency.
+            If False, initialize model directly on target device (requires more VRAM but allows
+            register_buffer in __init__ to work properly, enabling torch.compile compatibility
+            similar to Diffusers/xDiT).
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -97,8 +104,16 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    with set_default_dtype(default_dtype), torch.device("meta"):
-        model = model_cls(**init_params)
+    if use_meta_device:
+        # Memory-efficient loading: initialize on meta device, then load weights
+        with set_default_dtype(default_dtype), torch.device("meta"):
+            model = model_cls(**init_params)
+    else:
+        # Direct loading: initialize on target device (xDiT/Diffusers style)
+        # This allows register_buffer in __init__ to work properly
+        logger.info("Initializing model directly on device (use_meta_device=False)")
+        with set_default_dtype(default_dtype):
+            model = model_cls(**init_params)
 
     # Check if we should use FSDP
     use_fsdp = fsdp_inference

@@ -731,6 +731,7 @@ class TransformerLoader(ComponentLoader):
             cpu_offload=server_args.dit_cpu_offload,
             pin_cpu_memory=server_args.pin_cpu_memory,
             fsdp_inference=server_args.use_fsdp_inference,
+            use_meta_device=server_args.use_meta_device,
             # TODO(will): make these configurable
             default_dtype=default_dtype,
             param_dtype=torch.bfloat16,
