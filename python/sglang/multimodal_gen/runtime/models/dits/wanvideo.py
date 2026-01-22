@@ -795,6 +795,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             shard_rotary_emb_for_sp,
         )
         from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_sp_parallel_rank,
             get_sp_world_size,
         )
 
@@ -828,6 +829,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             hidden_states, self._seq_pad_len = self._shard_hidden_states_for_sp(
                 hidden_states
             )
+            if timestep.dim() == 2:
+                # Shard timestep [B, S] -> [B, S_local]
+                sp_rank = get_sp_parallel_rank()
+                sp_world_size = get_sp_world_size()
+                local_len = timestep.shape[1] // sp_world_size
+                timestep = timestep[:, sp_rank * local_len : (sp_rank + 1) * local_len]
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
             # ti2v
