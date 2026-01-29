@@ -5,10 +5,10 @@
    ```
    rocm/ali-private:ubuntu22.04_rocm6.4.3.127_sglang_5f2ee42_vllm_e858fc9_aiter_1b3efa9_20251202
    ```
-2. Install aiter main branch:
+2. Install aiter dev/perf branch:
    ```
    pip uninstall aiter
-   git clone -b main git@github.com:ROCm/aiter.git
+   git clone -b dev/perf git@github.com:ROCm/aiter.git
    cd aiter
    git submodule sync && git submodule update --init --recursive
    # for MI308
@@ -68,8 +68,8 @@ You can run the same request twice and check whether there is a diff in the outp
 # Notes
 If you want to switch to SGLang triton MoE, launch the service with this environment variable.
 ```
-export SGLANG_USE_AITER=1
-export SGLANG_USE_TRITON_MOE=0
+export SGLANG_USE_AITER=0
+export SGLANG_USE_TRITON_MOE=1
 ```
 LayerNorm may throw an error if aiter is not used. 
 
@@ -84,4 +84,9 @@ def forward_hip(
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 
         return self.forward_native(x, residual, **kwargs)
+```
+
+If you want to test the MoE operator unit test
+```
+python3 test_moe_bit_consistency.py
 ```
