@@ -125,6 +125,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual)
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
@@ -144,6 +145,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual)
         if not x.is_contiguous():
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
