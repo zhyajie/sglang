@@ -63,13 +63,30 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+    is_npu,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter import gelu_fast_vec
 
 logger = logging.getLogger(__name__)
 
 
 # === Vision Encoder === #
+
+class AiterGELU(nn.Module):
+    def forward(self, x: torch.Tensor):
+        out = torch.empty_like(x)
+        gelu_fast_vec(out, x)
+        return out
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -107,7 +124,10 @@ class Qwen3_VisionMLP(nn.Module):
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
         )
-        self.act = ACT2FN[hidden_act]
+        if _use_aiter and hidden_act.startswith("gelu"):
+            self.act = AiterGELU()
+        else:
+            self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
         x_fc1, _ = self.linear_fc1(x)
