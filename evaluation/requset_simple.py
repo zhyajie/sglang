@@ -4,7 +4,7 @@ import time
 
 text = "你好，请介绍一下人工智能的伦理问题，包括数据隐私、算法偏见、责任归属等方面。"
 
-url = "http://0.0.0.0:9000/generate"
+url = "http://0.0.0.0:6178/generate"
 headers = {
     "Content-Type": "application/json"
 }

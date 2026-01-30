@@ -402,7 +402,7 @@ $H^{+}-K^{+}-ATP$酶抑制剂抑酸作用并不在于阻断各种受体,而是�
 # url = "http://11.251.229.35:54409/" # h20 fp16
 # url = "http://11.129.72.76:45768/" # amd fp8
 
-url = "http://0.0.0.0:9000/generate"  # SGLang原生API端点
+url = "http://0.0.0.0:6178/generate"  # SGLang原生API端点
 headers = {
     "Content-Type": "application/json"
 }
