@@ -462,16 +462,16 @@ class Qwen3MoeAttention(nn.Module):
                 positions,
                 q,
                 k,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    and self.compatible_with_fused_kv_buffer
-                    else None
-                ),
+                # fused_set_kv_buffer_arg=(
+                #     create_fused_set_kv_buffer_arg(
+                #         value=v,
+                #         layer=self.attn,
+                #         forward_batch=forward_batch,
+                #     )
+                #     if enable_fused_set_kv_buffer(forward_batch)
+                #     and self.compatible_with_fused_kv_buffer
+                #     else None
+                # ),
             )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
