@@ -363,18 +363,24 @@ def fused_experts_impl(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ):
+    import sys
+    print(f"[DEBUG] fused_experts_impl: hidden={hidden_states.shape}, w1={w1.shape}", file=sys.stderr)
+
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
         padded_size = 0
 
     # Check constraints.
+    import sys
+    print(f"[DEBUG] fused_experts_impl: hidden_states.shape={hidden_states.shape}, w1.shape={w1.shape}, padded_size={padded_size}, _use_aiter={_use_aiter}", file=sys.stderr)
     if use_int4_w4a16:
         assert hidden_states.shape[1] // 2 == w1.shape[2], "Hidden size mismatch"
     else:
         assert (
             hidden_states.shape[1] == w1.shape[2] - padded_size
-        ), f"Hidden size mismatch"
+        ), f"Hidden size mismatch: {hidden_states.shape[1]} vs {w1.shape[2]} - {padded_size} (w1 shape: {w1.shape})"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -490,6 +496,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            filter_expert=filter_expert,
         )
         if activation == "silu":
             if gemm1_alpha is not None:
@@ -544,6 +551,7 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            filter_expert=filter_expert,
         )
 
         if routed_scaling_factor is None:

@@ -32,7 +32,10 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = bool(int(os.getenv("SGLANG_MOE_USE_AITER", "0")))
+# 使用统一的 SGLANG_USE_AITER_MOE 环境变量，如果未设置则跟随 SGLANG_USE_AITER
+from sglang.srt.utils import get_bool_env_var
+_use_aiter_base = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER_MOE") if os.getenv("SGLANG_USE_AITER_MOE") is not None else _use_aiter_base
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
@@ -43,11 +46,9 @@ elif _is_cpu and _is_cpu_amx_available:
 elif _is_hip:
     from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
 
-    if _use_aiter:
-        try:
-            from aiter import moe_sum
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    # 只在需要使用 aiter MoE 时导入 aiter.moe_sum
+    # 注意：这里不能在全局导入，因为即使不使用也会加载模块
+    # 所以我们在运行时按需导入
 
 
 if _is_cuda or _is_hip:
@@ -299,6 +300,8 @@ class TritonRunnerCore(MoeRunnerCore):
                     )
         elif _is_hip:
             if _use_aiter:
+                # 动态导入 aiter.moe_sum
+                from aiter import moe_sum
                 moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,

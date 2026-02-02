@@ -31,7 +31,10 @@ __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-if _use_aiter:
+# 添加独立的 MoE aiter 控制变量，默认跟随 SGLANG_USE_AITER
+import os
+_use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER_MOE") if os.getenv("SGLANG_USE_AITER_MOE") is not None else _use_aiter
+if _use_aiter_moe:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -432,7 +435,7 @@ class QuarkW8A8FP8MoEMethod(QuarkMoEMethod):
             )
 
         # aiter shuffle with padding
-        if _use_aiter:
+        if _use_aiter_moe:
             padding_size = get_int_env_var("AITER_MOE_PADDING_SIZE")
 
             N = layer.w2_weight.shape[-1]
@@ -524,7 +527,7 @@ class QuarkW8A8FP8MoEMethod(QuarkMoEMethod):
             and self.is_weight_per_channel
             and moe_runner_config.apply_router_weight_on_input
         )
-        if _use_aiter:
+        if _use_aiter_moe:
             topk_weights, topk_ids, _ = topk_output
             if _is_hip:
                 # aiter's moe_sorting requires topk_weights to be FP32 on ROCm

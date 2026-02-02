@@ -103,8 +103,11 @@ _is_fp8_fnuz = is_fp8_fnuz()
 
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# 添加独立的 MoE aiter 控制变量，默认跟随 SGLANG_USE_AITER
+import os
+_use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER_MOE") if os.getenv("SGLANG_USE_AITER_MOE") is not None else _use_aiter
 
-if _is_hip and (_use_aiter or _use_hip_int4):
+if _is_hip and (_use_aiter_moe or _use_hip_int4):
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -742,8 +745,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w2_input_scale = None
 
-            if _use_aiter:
-                # Pre-shuffle weights
+            if _use_aiter_moe:
+                # Pre-shuffle weights for aiter MoE
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
                 )
@@ -920,7 +923,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             padding_size,  # Avoid circular import
         )
 
-        if _use_aiter:
+        if _use_aiter_moe:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -932,7 +935,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             torch.cuda.empty_cache()
 
-            # ROCm (_use_aiter): using column-wise scaling
+            # ROCm (_use_aiter_moe): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
         elif get_bool_env_var("SGLANG_MOE_PADDING"):
@@ -1265,7 +1268,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 expert_mask=layer.expert_mask_gpu,
             )
 
-        if _use_aiter:
+        if _use_aiter_moe:
             assert not no_combine, f"{no_combine=} is not supported."
             if self.block_quant:
                 return fused_moe(

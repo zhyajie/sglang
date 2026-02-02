@@ -68,8 +68,11 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# 添加独立的 MoE aiter 控制变量，默认跟随 SGLANG_USE_AITER
+import os
+_use_aiter_moe = get_bool_env_var("SGLANG_USE_AITER_MOE") if os.getenv("SGLANG_USE_AITER_MOE") is not None else _use_aiter
 
-if _use_aiter:
+if _use_aiter_moe:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -331,7 +334,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 max_w13_scales, requires_grad=False
             )
 
-        if _use_aiter:
+        if _use_aiter_moe:
             padding_size = get_int_env_var("AITER_MOE_PADDING_SIZE")
 
             N = layer.w2_weight.shape[-1]
@@ -425,7 +428,16 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
         moe_runner_config = self.moe_runner_config
 
-        if _use_aiter:
+        # 添加调试日志
+        import logging
+        import sys
+        logger = logging.getLogger(__name__)
+        is_triton = self.runner.runner_backend.is_triton()
+        print(f"[DEBUG] CompressedTensors MoE apply: _use_aiter_moe={_use_aiter_moe}, runner_backend={self.runner.runner_backend}, is_triton={is_triton}", file=sys.stderr)
+        print(f"[DEBUG] layer.w13_weight.shape={layer.w13_weight.shape}", file=sys.stderr)
+
+        if _use_aiter_moe:
+            print("[DEBUG] Entering _use_aiter_moe block", file=sys.stderr)
             topk_weights, topk_ids, _ = topk_output
             if (
                 self.weight_quant.strategy == QuantizationStrategy.CHANNEL
@@ -468,6 +480,13 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     #expert_mask=layer.expert_mask_gpu,
                 )
         else:
+            # 简化调试 - 只在第一次打印
+            if not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"[DEBUG] Triton MoE: w13={layer.w13_weight.shape}, stride={layer.w13_weight.stride()}", file=sys.stderr)
+                print(f"[DEBUG] Triton MoE: w2={layer.w2_weight.shape}, stride={layer.w2_weight.stride()}", file=sys.stderr)
+                print(f"[DEBUG] w13_scale={layer.w13_weight_scale.shape}, stride={layer.w13_weight_scale.stride()}", file=sys.stderr)
+                print(f"[DEBUG] w13_weight is_contiguous={layer.w13_weight.is_contiguous()}", file=sys.stderr)
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
