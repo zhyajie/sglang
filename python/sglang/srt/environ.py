@@ -165,6 +165,7 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_MOE = EnvInt(None)  # None: use SGLANG_USE_AITER, 0: use SGLang Triton MoE, 1: use AITER MoE
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE = EnvBool(False)

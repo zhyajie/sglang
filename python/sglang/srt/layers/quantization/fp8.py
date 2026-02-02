@@ -102,7 +102,17 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# MoE backend selection logic:
+# - SGLANG_USE_AITER_MOE=0: Force use SGLang Triton MoE (no weight shuffle)
+# - SGLANG_USE_AITER_MOE=1: Force use AITER MoE (with weight shuffle)
+# - SGLANG_USE_AITER_MOE not set: Fall back to SGLANG_USE_AITER
+import os as _os
+_use_aiter_moe_env = _os.getenv("SGLANG_USE_AITER_MOE")
+if _use_aiter_moe_env is not None:
+    _use_aiter = (int(_use_aiter_moe_env) == 1) and _is_hip
+else:
+    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType

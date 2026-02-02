@@ -33,7 +33,18 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# MoE backend selection logic:
+# - SGLANG_USE_AITER_MOE=0: Force use SGLang Triton MoE (no weight shuffle, padding=0)
+# - SGLANG_USE_AITER_MOE=1: Force use AITER MoE (with weight shuffle)
+# - SGLANG_USE_AITER_MOE not set: Fall back to SGLANG_USE_AITER
+_use_aiter_moe_env = os.getenv("SGLANG_USE_AITER_MOE")
+if _use_aiter_moe_env is not None:
+    _use_aiter_moe_value = int(_use_aiter_moe_env)
+    _use_aiter = (_use_aiter_moe_value == 1) and _is_hip
+else:
+    _use_aiter_moe_value = None
+    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
@@ -50,7 +61,19 @@ elif _is_hip:
     else:
         from vllm import _custom_ops as vllm_ops
 
-padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
+# Determine padding size:
+# - If SGLANG_USE_AITER_MOE=0: Force padding=0 (SGLang Triton MoE doesn't need padding)
+# - If using AITER: No padding (AITER uses shuffled weights)
+# - Otherwise: Use SGLANG_MOE_PADDING environment variable
+if _use_aiter_moe_value == 0:
+    # Explicitly using SGLang Triton MoE - no padding
+    padding_size = 0
+elif _use_aiter:
+    # Using AITER MoE - no padding (uses shuffled weights)
+    padding_size = 0
+else:
+    # Default case: check SGLANG_MOE_PADDING
+    padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
 def inplace_fused_experts(

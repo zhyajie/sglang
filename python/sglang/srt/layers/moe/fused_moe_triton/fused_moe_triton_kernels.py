@@ -29,7 +29,11 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_moe = os.getenv("SGLANG_USE_AITER_MOE")
+if _use_aiter_moe is not None:
+    _use_aiter = bool(int(_use_aiter_moe)) and _is_hip
+else:
+    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     pass
