@@ -38,17 +38,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
-
-# MoE backend selection logic:
-# - SGLANG_USE_AITER_MOE=0: Force use SGLang Triton MoE (no weight shuffle)
-# - SGLANG_USE_AITER_MOE=1: Force use AITER MoE (with weight shuffle)
-# - SGLANG_USE_AITER_MOE not set: Fall back to SGLANG_USE_AITER
-import os as _os
-_use_aiter_moe_env = _os.getenv("SGLANG_USE_AITER_MOE")
-if _use_aiter_moe_env is not None:
-    _use_aiter = (int(_use_aiter_moe_env) == 1) and _is_hip
-else:
-    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType
@@ -174,6 +164,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         super().__init__()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
+        
+        # MoE backend selection logic:
+        # - SGLANG_USE_AITER_MOE=0: Force use SGLang Triton MoE
+        # - SGLANG_USE_AITER_MOE=1: Force use AITER MoE
+        # - SGLANG_USE_AITER_MOE not set: Fall back to SGLANG_USE_AITER
+        import os
+        _use_aiter_moe_env = os.getenv("SGLANG_USE_AITER_MOE")
+        if _use_aiter_moe_env is not None:
+            self._use_aiter_moe = (int(_use_aiter_moe_env) == 1) and _is_hip
+        else:
+            self._use_aiter_moe = _use_aiter  # Fall back to global setting
 
     def create_weights(
         self,
@@ -233,7 +234,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _use_aiter:
+        if self._use_aiter_moe:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -298,7 +299,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
-            if _use_aiter:
+            if self._use_aiter_moe:
                 assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:
