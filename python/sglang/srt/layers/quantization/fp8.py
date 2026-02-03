@@ -114,10 +114,28 @@ if _use_aiter_moe_env is not None:
 else:
     _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+# Enable small_batch ops with for-loop (max 16 tokens per batch)
+# Set SGLANG_AITER_MOE_USE_SMALL_BATCH_LOOP=1 to enable
+_use_small_batch_loop = _os.getenv("SGLANG_AITER_MOE_USE_SMALL_BATCH_LOOP", "0") == "1"
+
 if _is_hip and (_use_aiter or _use_hip_int4):
     from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
+    from aiter.fused_moe import fused_moe, moe_sorting
     from aiter.ops.shuffle import shuffle_weight
+
+    if _use_small_batch_loop:
+        try:
+            from aiter.ops.moe_op import (
+                moe_stage1_g1u1_small_batch1,
+                moe_stage2_g1u1_small_batch1,
+                moe_stage1_g1u1_small_batch,
+                moe_stage2_g1u1_small_batch,
+            )
+            _small_batch_ops_available = True
+        except ImportError:
+            _small_batch_ops_available = False
+    else:
+        _small_batch_ops_available = False
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -1248,6 +1266,58 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             use_shuffled_weight=False,
         )
 
+    def _apply_small_batch_loop(
+        self,
+        x: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        w1_scale: Optional[torch.Tensor] = None,
+        w2_scale: Optional[torch.Tensor] = None,
+        batch_size: int = 16,
+    ) -> torch.Tensor:
+        """Apply MoE using small_batch ops in a for-loop (max 16 tokens per batch)."""
+        total_tokens = x.shape[0]
+        model_dim = x.shape[1]
+        E, N1, K1 = w1.shape
+        TOPK = topk_ids.shape[1]
+        inter_dim = N1 // 2
+
+        batch_size = min(max(1, batch_size), 16)
+        output = torch.zeros(total_tokens, model_dim, dtype=x.dtype, device=x.device)
+
+        empty_scale = torch.empty((0, 1), dtype=torch.bfloat16, device=x.device)
+        w1_s = w1_scale if w1_scale is not None else empty_scale
+        w2_s = w2_scale if w2_scale is not None else empty_scale
+
+        for start_idx in range(0, total_tokens, batch_size):
+            end_idx = min(start_idx + batch_size, total_tokens)
+            batch_len = end_idx - start_idx
+
+            batch_hidden = x[start_idx:end_idx]
+            batch_topk_ids = topk_ids[start_idx:end_idx]
+            batch_topk_weight = topk_weights[start_idx:end_idx]
+
+            gemm1_out = torch.empty([batch_len, TOPK, inter_dim], dtype=x.dtype, device=x.device)
+
+            if batch_len == 1:
+                batch_output = torch.zeros([1, model_dim], dtype=x.dtype, device=x.device)
+                moe_stage1_g1u1_small_batch1(batch_hidden, w1, gemm1_out, batch_topk_ids, batch_topk_weight, w1_s)
+                moe_stage2_g1u1_small_batch1(gemm1_out, w2, batch_output, batch_topk_ids, batch_topk_weight, w2_s)
+            else:
+                BLOCK_M = 16
+                sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+                    batch_topk_ids, batch_topk_weight, E, K1, x.dtype, BLOCK_M, None, None, 0,
+                )
+                moe_stage1_g1u1_small_batch(batch_hidden, w1, gemm1_out, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w1_s)
+                moe_stage2_g1u1_small_batch(gemm1_out, w2, moe_buf, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, w2_s)
+                batch_output = moe_buf
+
+            output[start_idx:end_idx] = batch_output
+
+        return output
+
     def maybe_apply_hip_fused_experts(
         self,
         layer: torch.nn.Module,
@@ -1257,6 +1327,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         no_combine: bool = False,
     ) -> Optional[torch.Tensor]:
         topk_weights, topk_ids, _ = topk_output
+
+        # Use small_batch ops with for-loop (max 16 tokens per batch)
+        # Enable via SGLANG_AITER_MOE_USE_SMALL_BATCH_LOOP=1
+        if _use_aiter and _use_small_batch_loop and _small_batch_ops_available and not self.block_quant:
+            if (x.dtype == torch.bfloat16 and
+                layer.w13_weight.dtype == torch.float8_e4m3fnuz and
+                activation == "silu" and
+                layer.expert_mask_gpu is None and
+                not no_combine):
+                result = self._apply_small_batch_loop(
+                    x=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    w1_scale=layer.w13_weight_scale1,
+                    w2_scale=layer.w2_weight_scale1,
+                )
+                return result
+        
         if _use_hip_int4:
             # TODO: add triton kernel and add check _use_aiter
             assert not no_combine, f"{no_combine=} is not supported."
