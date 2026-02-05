@@ -920,11 +920,35 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     @functools.lru_cache(maxsize=50)
     def build_modulate_index(self, img_shapes: tuple[int, int, int], device):
+        """Build modulate_index to distinguish noisy and condition image tokens."""
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_sp_parallel_rank,
+            get_sp_world_size,
+        )
+
+        sp_world_size = get_sp_world_size()
+        sp_rank = get_sp_parallel_rank() if sp_world_size > 1 else 0
+
         modulate_index_list = []
         for sample in img_shapes:
-            first_size = sample[0][0] * sample[0][1] * sample[0][2]
-            total_size = sum(s[0] * s[1] * s[2] for s in sample)
-            idx = (torch.arange(total_size, device=device) >= first_size).int()
+            noisy_size = sample[0][0] * sample[0][1] * sample[0][2]
+            cond_size = sum(s[0] * s[1] * s[2] for s in sample[1:]) if len(sample) > 1 else 0
+
+            if sp_world_size > 1:
+                # Shard noisy and condition tokens separately, then concatenate
+                noisy_local_size = noisy_size // sp_world_size
+                cond_local_size = cond_size // sp_world_size if cond_size > 0 else 0
+
+                noisy_idx = torch.zeros(noisy_local_size, device=device, dtype=torch.int)
+                if cond_local_size > 0:
+                    cond_idx = torch.ones(cond_local_size, device=device, dtype=torch.int)
+                    idx = torch.cat([noisy_idx, cond_idx], dim=0)
+                else:
+                    idx = noisy_idx
+            else:
+                total_size = noisy_size + cond_size
+                idx = (torch.arange(total_size, device=device) >= noisy_size).int()
+
             modulate_index_list.append(idx)
 
         modulate_index = torch.stack(modulate_index_list)
