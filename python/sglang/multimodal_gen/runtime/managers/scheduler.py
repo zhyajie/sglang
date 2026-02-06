@@ -24,6 +24,8 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
+    StartProfileReq,
+    StopProfileReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
@@ -91,6 +93,8 @@ class Scheduler:
             SetLoraReq: self._handle_set_lora,
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
+            StartProfileReq: self._handle_start_profile,
+            StopProfileReq: self._handle_stop_profile,
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
@@ -155,6 +159,20 @@ class Scheduler:
         req = reqs[0]
         checksums = self.worker.get_weights_checksum(module_names=req.module_names)
         return OutputBatch(output=checksums)
+
+    def _handle_start_profile(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.start_profile(
+            output_dir=req.output_dir,
+            profile_id=req.profile_id,
+            activities=req.activities,
+            with_stack=req.with_stack,
+            record_shapes=req.record_shapes,
+        )
+
+    def _handle_stop_profile(self, reqs: List[Any]) -> OutputBatch:
+        req = reqs[0]
+        return self.worker.stop_profile(export_trace=req.export_trace)
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
