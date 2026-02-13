@@ -68,6 +68,7 @@ def apply_flashinfer_rope_qk_inplace(
         raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
 
     try:
+        raise ImportError("DEBUG: force fallback")
         from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
     except ImportError:
         # Triton fallback for AMD/ROCm where FlashInfer is not available

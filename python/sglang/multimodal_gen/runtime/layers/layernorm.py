@@ -71,6 +71,7 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.forward_native(x, residual)
         shape = x.shape
         device = x.device
         x = x.reshape(-1, shape[-1])
@@ -223,9 +224,7 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        shape = x.shape
-        x = x.view(-1, self.hidden_size)
-        return self.forward_triton(x).view(shape)
+        return self.forward_native(x)
 
     @torch.compile(backend="inductor", disable=current_platform.is_npu())
     def forward_native(
@@ -319,6 +318,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(residual, x, gate, shift, scale)
         if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 
@@ -425,6 +425,8 @@ class _NormScaleShift(CustomOp):
     def forward_cuda(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
+        return self.forward_native(x, shift, scale)
+
         if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
             import warnings
 
@@ -488,6 +490,7 @@ def apply_qk_norm(
     # Only try fused path on CUDA and when it won't introduce implicit copies.
     if (
         _is_cuda
+        and False # TODO(dark): fix this
         and allow_inplace
         and (q_eps == k_eps)
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
@@ -525,10 +528,4 @@ def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
 
 # TODO: Workaround, fuse norm with new select01 kernel
 def apply_layernorm_only(x: torch.Tensor, layernorm_scale_shift: LayerNormScaleShift):
-    return norm_infer(
-        x.view(-1, x.shape[-1]),
-        layernorm_scale_shift.norm.weight,
-        layernorm_scale_shift.norm.bias,
-        eps=layernorm_scale_shift.eps,
-        is_rms_norm=False,
-    ).view(x.shape)
+    return layernorm_scale_shift.norm(x)

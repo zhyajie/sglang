@@ -358,7 +358,16 @@ class QwenImageAttentionBlock(nn.Module):
         q, k, v = qkv.chunk(3, dim=-1)
 
         # apply attention
-        x = F.scaled_dot_product_attention(q, k, v)
+        # Use manual float32 attention instead of F.scaled_dot_product_attention
+        # to ensure consistent precision across NVIDIA (cuDNN) and AMD (MIOpen).
+        orig_dtype = q.dtype
+        q_f32 = q.float()
+        k_f32 = k.float()
+        v_f32 = v.float()
+        scale = q_f32.shape[-1] ** -0.5
+        attn_weights = torch.matmul(q_f32, k_f32.transpose(-2, -1)) * scale
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        x = torch.matmul(attn_weights, v_f32).to(orig_dtype)
 
         x = (
             x.squeeze(1)

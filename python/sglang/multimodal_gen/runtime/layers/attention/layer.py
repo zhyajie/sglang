@@ -1,10 +1,12 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import os
 from typing import Type
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -32,6 +34,72 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+# ---- DEBUG: force standard torch SDPA for precision debugging ----
+# Set SGLANG_FORCE_TORCH_SDPA=1 to bypass aiter/flash_attn and use
+# torch.nn.functional.scaled_dot_product_attention everywhere.
+_FORCE_TORCH_SDPA = os.environ.get("SGLANG_FORCE_TORCH_SDPA", "0") == "1"
+
+
+def _torch_sdpa_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    softmax_scale: float,
+    causal: bool = False,
+    dropout_p: float = 0.0,
+) -> torch.Tensor:
+    """Pure PyTorch manual attention for precision debugging.
+
+    Uses individual torch ops (matmul, softmax, etc.) instead of
+    F.scaled_dot_product_attention, which may internally dispatch to
+    flash-attention or memory-efficient backends.
+
+    Args:
+        query/key/value: [B, S, H, D]
+        softmax_scale: scaling factor for attention
+        causal: whether to use causal masking
+        dropout_p: dropout probability
+
+    Returns:
+        output: [B, S, H, D]
+    """
+    orig_dtype = query.dtype
+    # [B, S, H, D] -> [B, H, S, D]
+    q = query.transpose(1, 2).float()
+    k = key.transpose(1, 2).float()
+    v = value.transpose(1, 2).float()
+
+    # Handle GQA: repeat KV heads to match Q heads
+    if q.shape[1] != k.shape[1]:
+        num_q_heads = q.shape[1]
+        num_kv_heads = k.shape[1]
+        repeat_factor = num_q_heads // num_kv_heads
+        # [B, H_kv, S, D] -> [B, H_q, S, D]
+        k = k.repeat_interleave(repeat_factor, dim=1)
+        v = v.repeat_interleave(repeat_factor, dim=1)
+
+    # attn_weights: [B, H, S_q, S_k]
+    attn_weights = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
+
+    # causal mask
+    if causal:
+        S_q, S_k = attn_weights.shape[-2], attn_weights.shape[-1]
+        causal_mask = torch.triu(
+            torch.ones(S_q, S_k, device=attn_weights.device, dtype=torch.bool),
+            diagonal=1,
+        )
+        attn_weights.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+    attn_weights = torch.softmax(attn_weights, dim=-1)
+
+    if dropout_p > 0.0 and query.requires_grad:
+        attn_weights = F.dropout(attn_weights, p=dropout_p)
+
+    # [B, H, S_q, D]
+    output = torch.matmul(attn_weights, v)
+    # [B, H, S, D] -> [B, S, H, D]
+    return output.transpose(1, 2).to(orig_dtype)
 
 
 class UlyssesAttention(nn.Module):
@@ -134,7 +202,10 @@ class UlyssesAttention(nn.Module):
 
         q, k, v = qkv.chunk(3, dim=0)
 
-        output = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+        if _FORCE_TORCH_SDPA:
+            output = _torch_sdpa_forward(q, k, v, self.softmax_scale)
+        else:
+            output = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         # Redistribute back if using sequence parallelism
         replicated_output = None
@@ -205,9 +276,12 @@ class UlyssesAttention_VSA(UlyssesAttention):
         qkvg = self.attn_impl.preprocess_qkv(qkvg, ctx_attn_metadata)
 
         q, k, v, gate_compress = qkvg.chunk(4, dim=0)
-        output = self.attn_impl.forward(
-            q, k, v, gate_compress=gate_compress, attn_metadata=ctx_attn_metadata
-        )  # type: ignore[call-arg]
+        if _FORCE_TORCH_SDPA:
+            output = _torch_sdpa_forward(q, k, v, self.softmax_scale)
+        else:
+            output = self.attn_impl.forward(
+                q, k, v, gate_compress=gate_compress, attn_metadata=ctx_attn_metadata
+            )  # type: ignore[call-arg]
 
         # Apply backend-specific postprocess_output
         output = self.attn_impl.postprocess_output(output, ctx_attn_metadata)
@@ -282,7 +356,10 @@ class LocalAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
-        output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
+        if _FORCE_TORCH_SDPA:
+            output = _torch_sdpa_forward(q, k, v, self.softmax_scale)
+        else:
+            output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
 
 
@@ -361,7 +438,12 @@ class USPAttention(nn.Module):
         ctx_attn_metadata = forward_context.attn_metadata
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            if _FORCE_TORCH_SDPA:
+                out = _torch_sdpa_forward(
+                    q, k, v, self.softmax_scale, self.causal, self.dropout_p
+                )
+            else:
+                out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
 
         # Ulysses-style All-to-All for sequence/head sharding
@@ -373,17 +455,27 @@ class USPAttention(nn.Module):
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
-            out = ring_attn(
-                q,
-                k,
-                v,
-                attn_impl=self.attn_impl,
-                is_causal=self.causal,
-                dropout_p=self.dropout_p,
-            )
+            if _FORCE_TORCH_SDPA:
+                out = _torch_sdpa_forward(
+                    q, k, v, self.softmax_scale, self.causal, self.dropout_p
+                )
+            else:
+                out = ring_attn(
+                    q,
+                    k,
+                    v,
+                    attn_impl=self.attn_impl,
+                    is_causal=self.causal,
+                    dropout_p=self.dropout_p,
+                )
         else:
             # -> [B, S, H_local, D]
-            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+            if _FORCE_TORCH_SDPA:
+                out = _torch_sdpa_forward(
+                    q, k, v, self.softmax_scale, self.causal, self.dropout_p
+                )
+            else:
+                out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:

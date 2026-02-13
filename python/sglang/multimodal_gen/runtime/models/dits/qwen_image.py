@@ -41,7 +41,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
-_is_cuda = current_platform.is_cuda()
+_is_cuda_alike = current_platform.is_cuda_alike()
 
 
 def _get_qkv_projections(
@@ -716,7 +716,7 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch : 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-            if _is_cuda:
+            if _is_cuda_alike:
                 if is_scale_residual:
                     x = gate_x * x + residual_x
                     residual_out = x
