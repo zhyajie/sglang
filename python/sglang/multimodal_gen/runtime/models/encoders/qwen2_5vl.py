@@ -608,6 +608,12 @@ class Qwen2_5_VLModel(nn.Module):
         self.language_model = Qwen2_5_VLTextModel(config.text_config)
 
         if enable_image_understanding:
+            # Force eager attention (pure PyTorch matmul+softmax) for ViT
+            # to ensure consistent precision across NVIDIA and AMD platforms.
+            # Without this, transformers uses F.scaled_dot_product_attention
+            # which dispatches to different backends (cuDNN vs MIOpen).
+            if os.environ.get("SGLANG_FORCE_TORCH_SDPA", "0") == "1":
+                config.vision_config._attn_implementation = "eager"
             self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
                 config.vision_config
             )
