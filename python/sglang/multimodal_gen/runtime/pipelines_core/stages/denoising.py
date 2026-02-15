@@ -42,6 +42,19 @@ _LOAD_DIR = os.environ.get("SGLANG_LOAD_DIR", "")
 _DUMP_POINTS = set(os.environ.get("SGLANG_DUMP_POINTS", "").split(",")) if os.environ.get("SGLANG_DUMP_POINTS") else set()
 _LOAD_POINTS = set(os.environ.get("SGLANG_LOAD_POINTS", "").split(",")) if os.environ.get("SGLANG_LOAD_POINTS") else set()
 
+# ---- Startup banner: always print config so user knows what's active ----
+print("=" * 70)
+print("[CROSS-PLATFORM DEBUG] Tensor dump/load configuration (denoising):")
+print(f"  SGLANG_DUMP_DIR    = {_DUMP_DIR or '(not set)'}")
+print(f"  SGLANG_DUMP_POINTS = {_DUMP_POINTS or '(not set)'}")
+print(f"  SGLANG_LOAD_DIR    = {_LOAD_DIR or '(not set)'}")
+print(f"  SGLANG_LOAD_POINTS = {_LOAD_POINTS or '(not set)'}")
+if _DUMP_DIR and _LOAD_DIR and _DUMP_DIR == _LOAD_DIR:
+    print("  ⚠️  WARNING: DUMP_DIR == LOAD_DIR! Local results will OVERWRITE loaded files!")
+if not _DUMP_DIR and not _LOAD_DIR:
+    print("  (disabled — set SGLANG_DUMP_DIR or SGLANG_LOAD_DIR to enable)")
+print("=" * 70)
+
 
 def _dump_tensor(name: str, tensor: torch.Tensor):
     """Dump a tensor to SGLANG_DUMP_DIR/{name}.pt"""
@@ -50,7 +63,7 @@ def _dump_tensor(name: str, tensor: torch.Tensor):
     os.makedirs(_DUMP_DIR, exist_ok=True)
     path = os.path.join(_DUMP_DIR, f"{name}.pt")
     torch.save(tensor.detach().cpu(), path)
-    print(f"[DUMP] Saved {name} shape={list(tensor.shape)} dtype={tensor.dtype} → {path}")
+    print(f"[DUMP] {name:>40s} | shape={str(list(tensor.shape)):>30s} | dtype={str(tensor.dtype):>15s} | → {path}")
 
 
 def _load_tensor(name: str, reference: torch.Tensor) -> torch.Tensor:
@@ -59,13 +72,16 @@ def _load_tensor(name: str, reference: torch.Tensor) -> torch.Tensor:
         return reference
     path = os.path.join(_LOAD_DIR, f"{name}.pt")
     if not os.path.exists(path):
-        print(f"[LOAD] WARNING: {path} not found, using local tensor")
+        print(f"[LOAD] ⚠️  {name}: file NOT FOUND at {path}, using local tensor")
         return reference
     loaded = torch.load(path, map_location="cpu", weights_only=True)
     loaded = loaded.to(device=reference.device, dtype=reference.dtype)
-    # Compare with local
+    # Compare with local value
     diff = (loaded.float() - reference.float()).abs()
-    print(f"[LOAD] Loaded {name} shape={list(loaded.shape)} | max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e}")
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    status = "✅ MATCH" if max_diff < 1e-5 else ("⚠️  SMALL DIFF" if max_diff < 1e-2 else "❌ LARGE DIFF")
+    print(f"[LOAD] {name:>40s} | shape={str(list(loaded.shape)):>30s} | max_diff={max_diff:.6e} mean_diff={mean_diff:.6e} | {status}")
     return loaded
 
 
