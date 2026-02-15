@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.utils.common import add_prefix
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
+import os
 from typing import Callable, Iterable, Optional, Tuple, Union
 
 try:
@@ -63,6 +64,47 @@ except ImportError:
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
+
+# ---- Cross-platform debug: dump/load for ViT vs LLM isolation ----
+_DUMP_DIR = os.environ.get("SGLANG_DUMP_DIR", "")
+_LOAD_DIR = os.environ.get("SGLANG_LOAD_DIR", "")
+_DUMP_POINTS = set(os.environ.get("SGLANG_DUMP_POINTS", "").split(",")) if os.environ.get("SGLANG_DUMP_POINTS") else set()
+_LOAD_POINTS = set(os.environ.get("SGLANG_LOAD_POINTS", "").split(",")) if os.environ.get("SGLANG_LOAD_POINTS") else set()
+_qwen_forward_call_count = 0  # 区分正向/负向 forward 调用
+
+
+def _should_dump(point):
+    return bool(_DUMP_DIR) and (point in _DUMP_POINTS or "all" in _DUMP_POINTS)
+
+
+def _should_load(point):
+    return bool(_LOAD_DIR) and (point in _LOAD_POINTS or "all" in _LOAD_POINTS)
+
+
+def _dump_tensor(name, tensor):
+    if not _DUMP_DIR:
+        return
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    path = os.path.join(_DUMP_DIR, f"{name}.pt")
+    torch.save(tensor.detach().cpu(), path)
+    print(f"[DUMP] {name:>40s} | shape={str(list(tensor.shape)):>30s} | dtype={str(tensor.dtype):>15s} | → {path}")
+
+
+def _load_tensor(name, reference):
+    if not _LOAD_DIR:
+        return reference
+    path = os.path.join(_LOAD_DIR, f"{name}.pt")
+    if not os.path.exists(path):
+        print(f"[LOAD] ⚠️  {name}: file NOT FOUND at {path}, using local tensor")
+        return reference
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    loaded = loaded.to(device=reference.device, dtype=reference.dtype)
+    diff = (loaded.float() - reference.float()).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    status = "✅ MATCH" if max_diff < 1e-5 else ("⚠️  SMALL DIFF" if max_diff < 1e-2 else "❌ LARGE DIFF")
+    print(f"[LOAD] {name:>40s} | shape={str(list(loaded.shape)):>30s} | max_diff={max_diff:.6e} mean_diff={mean_diff:.6e} | {status}")
+    return loaded
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionTransformerPretrainedModel,
     Qwen2_5_VLAttention,
@@ -919,6 +961,16 @@ class Qwen2_5_VLModel(nn.Module):
             image_embeds = torch.cat(image_embeds, dim=0).to(
                 inputs_embeds.device, inputs_embeds.dtype
             )
+
+            # ---- Cross-platform dump/load: ViT output (image_embeds) ----
+            global _qwen_forward_call_count
+            _call_tag = "pos" if _qwen_forward_call_count % 2 == 0 else "neg"
+            if _should_dump("vit_output"):
+                _dump_tensor(f"vit_image_embeds_{_call_tag}", image_embeds)
+            if _should_load("vit_output"):
+                image_embeds = _load_tensor(f"vit_image_embeds_{_call_tag}", image_embeds)
+            # ---- End ----
+
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
             )
@@ -972,6 +1024,14 @@ class Qwen2_5_VLModel(nn.Module):
                     )
                 delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
                 position_ids += delta.to(position_ids.device)
+
+        # ---- Cross-platform dump/load: LLM input (inputs_embeds after ViT merge) ----
+        if _should_dump("llm_input"):
+            _dump_tensor(f"llm_inputs_embeds_{_call_tag}", inputs_embeds)
+        if _should_load("llm_input"):
+            inputs_embeds = _load_tensor(f"llm_inputs_embeds_{_call_tag}", inputs_embeds)
+        _qwen_forward_call_count += 1
+        # ---- End ----
 
         outputs = self.language_model(
             input_ids=None,
