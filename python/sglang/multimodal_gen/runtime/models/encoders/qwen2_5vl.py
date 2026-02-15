@@ -71,6 +71,61 @@ _LOAD_DIR = os.environ.get("SGLANG_LOAD_DIR", "")
 _DUMP_POINTS = set(os.environ.get("SGLANG_DUMP_POINTS", "").split(",")) if os.environ.get("SGLANG_DUMP_POINTS") else set()
 _LOAD_POINTS = set(os.environ.get("SGLANG_LOAD_POINTS", "").split(",")) if os.environ.get("SGLANG_LOAD_POINTS") else set()
 _qwen_forward_call_count = 0  # 区分正向/负向 forward 调用
+_vit_hooks_registered = False  # 是否已注册 ViT 逐层 hook
+
+
+def _register_vit_layer_hooks(vit_model):
+    """给 ViT 的每一层、patch_embed、merger 注册 dump/load hook"""
+    global _vit_hooks_registered
+    if _vit_hooks_registered:
+        return
+    _vit_hooks_registered = True
+
+    def _make_hook(name):
+        def hook_fn(module, input, output):
+            global _qwen_forward_call_count
+            call_tag = "pos" if _qwen_forward_call_count % 2 == 0 else "neg"
+            tensor = output[0] if isinstance(output, tuple) else output
+            full_name = f"vit_{name}_{call_tag}"
+
+            if _should_dump("vit_layers"):
+                _dump_tensor(full_name, tensor)
+            if _should_load("vit_layers"):
+                loaded = _load_tensor(full_name, tensor)
+                # 替换 output（仅对非 tuple 的情况）
+                if not isinstance(output, tuple):
+                    output_ref = [output]
+                    output_ref[0] = loaded
+                    return loaded
+                else:
+                    return (loaded,) + output[1:]
+        return hook_fn
+
+    # patch_embed
+    if hasattr(vit_model, 'patch_embed'):
+        vit_model.patch_embed.register_forward_hook(_make_hook("patch_embed"))
+        print(f"[HOOK] Registered hook: vit_patch_embed")
+
+    # 每个 block（32层）
+    for i, block in enumerate(vit_model.blocks):
+        block.register_forward_hook(_make_hook(f"block_{i:02d}"))
+
+        # block 内部的子模块也加 hook：norm1, attn, norm2, mlp
+        if hasattr(block, 'norm1'):
+            block.norm1.register_forward_hook(_make_hook(f"block_{i:02d}_norm1"))
+        if hasattr(block, 'attn'):
+            block.attn.register_forward_hook(_make_hook(f"block_{i:02d}_attn"))
+        if hasattr(block, 'norm2'):
+            block.norm2.register_forward_hook(_make_hook(f"block_{i:02d}_norm2"))
+        if hasattr(block, 'mlp'):
+            block.mlp.register_forward_hook(_make_hook(f"block_{i:02d}_mlp"))
+
+    print(f"[HOOK] Registered {len(vit_model.blocks)} block hooks (with sub-module hooks)")
+
+    # merger
+    if hasattr(vit_model, 'merger'):
+        vit_model.merger.register_forward_hook(_make_hook("merger"))
+        print(f"[HOOK] Registered hook: vit_merger")
 
 
 def _should_dump(point):
@@ -957,19 +1012,33 @@ class Qwen2_5_VLModel(nn.Module):
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
         if pixel_values is not None:
-            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
-            image_embeds = torch.cat(image_embeds, dim=0).to(
-                inputs_embeds.device, inputs_embeds.dtype
-            )
+            # 注册 ViT 逐层 hook（只在第一次调用时注册）
+            if _should_dump("vit_layers") or _should_load("vit_layers"):
+                _register_vit_layer_hooks(self.visual)
 
-            # ---- Cross-platform dump/load: ViT output (image_embeds) ----
+            image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+            image_embeds = torch.cat(image_embeds, dim=0)
+
+            # ---- Cross-platform dump/load: ViT output (before dtype cast) ----
             global _qwen_forward_call_count
             _call_tag = "pos" if _qwen_forward_call_count % 2 == 0 else "neg"
             if _should_dump("vit_output"):
                 _dump_tensor(f"vit_image_embeds_{_call_tag}", image_embeds)
+                # 自验 bit 一致性：用相同输入再跑一次 ViT forward
+                with torch.no_grad():
+                    image_embeds_verify = self.get_image_features(pixel_values, image_grid_thw)
+                    image_embeds_verify = torch.cat(image_embeds_verify, dim=0)
+                bit_equal = torch.equal(image_embeds, image_embeds_verify)
+                if bit_equal:
+                    print(f"[VERIFY] ✅ ViT self-check BIT IDENTICAL ({_call_tag})")
+                else:
+                    diff = (image_embeds.float() - image_embeds_verify.float()).abs()
+                    print(f"[VERIFY] ❌ ViT self-check DIFF ({_call_tag}): max={diff.max().item():.6e}")
             if _should_load("vit_output"):
                 image_embeds = _load_tensor(f"vit_image_embeds_{_call_tag}", image_embeds)
             # ---- End ----
+
+            image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
 
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
