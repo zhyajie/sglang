@@ -226,7 +226,8 @@ class LayerNorm(CustomOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self.forward_native(x)
 
-    @torch.compile(backend="inductor", disable=current_platform.is_npu())
+    # @torch.compile(backend="inductor", disable=current_platform.is_npu())
+    # Disabled torch.compile to ensure consistent RNG state across platforms
     def forward_native(
         self,
         x: torch.Tensor,

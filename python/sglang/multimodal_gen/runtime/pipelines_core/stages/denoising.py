@@ -19,6 +19,63 @@ import torch.nn as nn
 from einops import rearrange
 from tqdm.auto import tqdm
 
+# ---- Cross-platform precision debugging: tensor dump/load ----
+# SGLANG_DUMP_DIR: dump tensors to this directory (e.g., /tmp/h20_dump)
+# SGLANG_LOAD_DIR: load tensors from this directory to replace local computation
+#
+# Usage examples:
+#   On H20:   export SGLANG_DUMP_DIR=/shared/h20_dump
+#   On MI308: export SGLANG_LOAD_DIR=/shared/h20_dump
+#
+# Supported dump/load points (controlled by SGLANG_DUMP_POINTS / SGLANG_LOAD_POINTS):
+#   "dit_input"  — DIT denoising loop input (latents, prompt_embeds, image_latent, timesteps, etc.)
+#   "dit_output" — DIT denoising loop output (final latents before VAE)
+#   "dit_step_N" — DIT step N output (e.g., "dit_step_0", "dit_step_5")
+#   "all_steps"  — dump every DIT step output
+#
+# Examples:
+#   export SGLANG_DUMP_DIR=/tmp/h20_dump SGLANG_DUMP_POINTS=dit_input,dit_output
+#   export SGLANG_LOAD_DIR=/tmp/h20_dump SGLANG_LOAD_POINTS=dit_input
+#   export SGLANG_DUMP_DIR=/tmp/h20_dump SGLANG_DUMP_POINTS=all_steps
+_DUMP_DIR = os.environ.get("SGLANG_DUMP_DIR", "")
+_LOAD_DIR = os.environ.get("SGLANG_LOAD_DIR", "")
+_DUMP_POINTS = set(os.environ.get("SGLANG_DUMP_POINTS", "").split(",")) if os.environ.get("SGLANG_DUMP_POINTS") else set()
+_LOAD_POINTS = set(os.environ.get("SGLANG_LOAD_POINTS", "").split(",")) if os.environ.get("SGLANG_LOAD_POINTS") else set()
+
+
+def _dump_tensor(name: str, tensor: torch.Tensor):
+    """Dump a tensor to SGLANG_DUMP_DIR/{name}.pt"""
+    if not _DUMP_DIR:
+        return
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    path = os.path.join(_DUMP_DIR, f"{name}.pt")
+    torch.save(tensor.detach().cpu(), path)
+    print(f"[DUMP] Saved {name} shape={list(tensor.shape)} dtype={tensor.dtype} → {path}")
+
+
+def _load_tensor(name: str, reference: torch.Tensor) -> torch.Tensor:
+    """Load a tensor from SGLANG_LOAD_DIR/{name}.pt, cast to reference's device/dtype"""
+    if not _LOAD_DIR:
+        return reference
+    path = os.path.join(_LOAD_DIR, f"{name}.pt")
+    if not os.path.exists(path):
+        print(f"[LOAD] WARNING: {path} not found, using local tensor")
+        return reference
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    loaded = loaded.to(device=reference.device, dtype=reference.dtype)
+    # Compare with local
+    diff = (loaded.float() - reference.float()).abs()
+    print(f"[LOAD] Loaded {name} shape={list(loaded.shape)} | max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e}")
+    return loaded
+
+
+def _should_dump(point: str) -> bool:
+    return bool(_DUMP_DIR) and (point in _DUMP_POINTS or "all" in _DUMP_POINTS)
+
+
+def _should_load(point: str) -> bool:
+    return bool(_LOAD_DIR) and (point in _LOAD_POINTS or "all" in _LOAD_POINTS)
+
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -991,6 +1048,34 @@ class DenoisingStage(PipelineStage):
         seq_len = prepared_vars["seq_len"]
         guidance = prepared_vars["guidance"]
 
+        # ---- Cross-platform dump/load: DIT input ----
+        if _should_dump("dit_input"):
+            _dump_tensor("dit_input_latents", latents)
+            _dump_tensor("dit_input_timesteps", timesteps)
+            if batch.image_latent is not None:
+                _dump_tensor("dit_input_image_latent", batch.image_latent)
+            for idx, pe in enumerate(batch.prompt_embeds):
+                _dump_tensor(f"dit_input_prompt_embeds_{idx}", pe)
+            if batch.negative_prompt_embeds is not None:
+                for idx, ne in enumerate(batch.negative_prompt_embeds):
+                    _dump_tensor(f"dit_input_neg_prompt_embeds_{idx}", ne)
+            if guidance is not None:
+                _dump_tensor("dit_input_guidance", guidance)
+
+        if _should_load("dit_input"):
+            latents = _load_tensor("dit_input_latents", latents)
+            timesteps = _load_tensor("dit_input_timesteps", timesteps)
+            if batch.image_latent is not None:
+                batch.image_latent = _load_tensor("dit_input_image_latent", batch.image_latent)
+            for idx, pe in enumerate(batch.prompt_embeds):
+                batch.prompt_embeds[idx] = _load_tensor(f"dit_input_prompt_embeds_{idx}", pe)
+            if batch.negative_prompt_embeds is not None:
+                for idx, ne in enumerate(batch.negative_prompt_embeds):
+                    batch.negative_prompt_embeds[idx] = _load_tensor(f"dit_input_neg_prompt_embeds_{idx}", ne)
+            if guidance is not None:
+                guidance = _load_tensor("dit_input_guidance", guidance)
+        # ---- End cross-platform dump/load ----
+
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
@@ -1087,6 +1172,14 @@ class DenoisingStage(PipelineStage):
                             batch, server_args, reserved_frames_mask, latents, z
                         )
 
+                        # ---- Cross-platform dump/load: per-step latents ----
+                        step_name = f"dit_step_{i}"
+                        if _should_dump(step_name) or _should_dump("all_steps"):
+                            _dump_tensor(step_name, latents)
+                        if _should_load(step_name):
+                            latents = _load_tensor(step_name, latents)
+                        # ---- End cross-platform dump/load ----
+
                         # save trajectory latents if needed
                         if batch.return_trajectory_latents:
                             trajectory_timesteps.append(t_host)
@@ -1104,6 +1197,13 @@ class DenoisingStage(PipelineStage):
                             self.step_profile()
 
         denoising_end_time = time.time()
+
+        # ---- Cross-platform dump/load: DIT output ----
+        if _should_dump("dit_output"):
+            _dump_tensor("dit_output_latents", latents)
+        if _should_load("dit_output"):
+            latents = _load_tensor("dit_output_latents", latents)
+        # ---- End cross-platform dump/load ----
 
         if num_timesteps > 0 and not is_warmup:
             self.log_info(

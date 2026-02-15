@@ -5,11 +5,52 @@
 Decoding stage for diffusion pipelines.
 """
 
+import os
 import weakref
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+
+# ---- Cross-platform precision debugging: tensor dump/load for VAE ----
+# Reuses the same env vars as denoising.py:
+#   SGLANG_DUMP_DIR / SGLANG_LOAD_DIR / SGLANG_DUMP_POINTS / SGLANG_LOAD_POINTS
+# Supported points: "vae_input", "vae_output"
+_DUMP_DIR = os.environ.get("SGLANG_DUMP_DIR", "")
+_LOAD_DIR = os.environ.get("SGLANG_LOAD_DIR", "")
+_DUMP_POINTS = set(os.environ.get("SGLANG_DUMP_POINTS", "").split(",")) if os.environ.get("SGLANG_DUMP_POINTS") else set()
+_LOAD_POINTS = set(os.environ.get("SGLANG_LOAD_POINTS", "").split(",")) if os.environ.get("SGLANG_LOAD_POINTS") else set()
+
+
+def _dump_tensor(name: str, tensor: torch.Tensor):
+    if not _DUMP_DIR:
+        return
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    path = os.path.join(_DUMP_DIR, f"{name}.pt")
+    torch.save(tensor.detach().cpu(), path)
+    print(f"[DUMP] Saved {name} shape={list(tensor.shape)} dtype={tensor.dtype} → {path}")
+
+
+def _load_tensor(name: str, reference: torch.Tensor) -> torch.Tensor:
+    if not _LOAD_DIR:
+        return reference
+    path = os.path.join(_LOAD_DIR, f"{name}.pt")
+    if not os.path.exists(path):
+        print(f"[LOAD] WARNING: {path} not found, using local tensor")
+        return reference
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    loaded = loaded.to(device=reference.device, dtype=reference.dtype)
+    diff = (loaded.float() - reference.float()).abs()
+    print(f"[LOAD] Loaded {name} shape={list(loaded.shape)} | max_diff={diff.max().item():.6e} mean_diff={diff.mean().item():.6e}")
+    return loaded
+
+
+def _should_dump(point: str) -> bool:
+    return bool(_DUMP_DIR) and (point in _DUMP_POINTS or "all" in _DUMP_POINTS)
+
+
+def _should_load(point: str) -> bool:
+    return bool(_LOAD_DIR) and (point in _LOAD_POINTS or "all" in _LOAD_POINTS)
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
@@ -197,7 +238,19 @@ class DecodingStage(PipelineStage):
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
+        # ---- Cross-platform dump/load: VAE input ----
+        if _should_dump("vae_input"):
+            _dump_tensor("vae_input_latents", batch.latents)
+        if _should_load("vae_input"):
+            batch.latents = _load_tensor("vae_input_latents", batch.latents)
+        # ---- End cross-platform dump/load ----
+
         frames = self.decode(batch.latents, server_args)
+
+        # ---- Cross-platform dump/load: VAE output ----
+        if _should_dump("vae_output"):
+            _dump_tensor("vae_output_frames", frames)
+        # ---- End cross-platform dump/load ----
 
         # decode trajectory latents if needed
         if batch.return_trajectory_decoded:
