@@ -7,6 +7,8 @@ Image encoding stages for I2V diffusion pipelines.
 This module contains implementations of image encoding stages for diffusion pipelines.
 """
 
+import os
+
 import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -16,6 +18,46 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+
+# ---- Cross-platform debug: dump/load for image encoding stage ----
+_DUMP_DIR = os.environ.get("SGLANG_DUMP_DIR", "")
+_LOAD_DIR = os.environ.get("SGLANG_LOAD_DIR", "")
+_DUMP_POINTS = set(os.environ.get("SGLANG_DUMP_POINTS", "").split(",")) if os.environ.get("SGLANG_DUMP_POINTS") else set()
+_LOAD_POINTS = set(os.environ.get("SGLANG_LOAD_POINTS", "").split(",")) if os.environ.get("SGLANG_LOAD_POINTS") else set()
+
+
+def _should_dump(point):
+    return bool(_DUMP_DIR) and (point in _DUMP_POINTS or "all" in _DUMP_POINTS)
+
+
+def _should_load(point):
+    return bool(_LOAD_DIR) and (point in _LOAD_POINTS or "all" in _LOAD_POINTS)
+
+
+def _dump_tensor(name, tensor):
+    if not _DUMP_DIR:
+        return
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    path = os.path.join(_DUMP_DIR, f"{name}.pt")
+    torch.save(tensor.detach().cpu(), path)
+    print(f"[DUMP] {name:>40s} | shape={str(list(tensor.shape)):>30s} | dtype={str(tensor.dtype):>15s} | → {path}")
+
+
+def _load_tensor(name, reference):
+    if not _LOAD_DIR:
+        return reference
+    path = os.path.join(_LOAD_DIR, f"{name}.pt")
+    if not os.path.exists(path):
+        print(f"[LOAD] ⚠️  {name}: file NOT FOUND at {path}, using local tensor")
+        return reference
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    loaded = loaded.to(device=reference.device, dtype=reference.dtype)
+    diff = (loaded.float() - reference.float()).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    status = "✅ MATCH" if max_diff < 1e-5 else ("⚠️  SMALL DIFF" if max_diff < 1e-2 else "❌ LARGE DIFF")
+    print(f"[LOAD] {name:>40s} | shape={str(list(loaded.shape)):>30s} | max_diff={max_diff:.6e} mean_diff={mean_diff:.6e} | {status}")
+    return loaded
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
@@ -137,6 +179,19 @@ class ImageEncodingStage(PipelineStage):
                     images=image, return_tensors="pt", **neg_image_processor_kwargs
                 ).to(cuda_device)
 
+            # ---- Cross-platform dump/load: encoder input ----
+            if _should_dump("encoder_input"):
+                _dump_tensor("encoder_input_ids", image_inputs.input_ids)
+                _dump_tensor("encoder_attention_mask", image_inputs.attention_mask)
+                _dump_tensor("encoder_pixel_values", image_inputs.pixel_values)
+                _dump_tensor("encoder_image_grid_thw", image_inputs.image_grid_thw)
+            if _should_load("encoder_input"):
+                image_inputs.input_ids = _load_tensor("encoder_input_ids", image_inputs.input_ids)
+                image_inputs.attention_mask = _load_tensor("encoder_attention_mask", image_inputs.attention_mask)
+                image_inputs.pixel_values = _load_tensor("encoder_pixel_values", image_inputs.pixel_values)
+                image_inputs.image_grid_thw = _load_tensor("encoder_image_grid_thw", image_inputs.image_grid_thw)
+            # ---- End ----
+
             with set_forward_context(current_timestep=0, attn_metadata=None):
                 outputs = self.text_encoder(
                     input_ids=image_inputs.input_ids,
@@ -153,14 +208,29 @@ class ImageEncodingStage(PipelineStage):
                         image_grid_thw=neg_image_inputs.image_grid_thw,
                         output_hidden_states=True,
                     )
-            batch.prompt_embeds.append(
-                self.encoding_qwen_image_edit(outputs, image_inputs)
-            )
+
+            prompt_embeds_pos = self.encoding_qwen_image_edit(outputs, image_inputs)
+
+            # ---- Cross-platform dump/load: encoder output (prompt_embeds) ----
+            if _should_dump("encoder_output"):
+                _dump_tensor("encoder_prompt_embeds", prompt_embeds_pos)
+            if _should_load("encoder_output"):
+                prompt_embeds_pos = _load_tensor("encoder_prompt_embeds", prompt_embeds_pos)
+            # ---- End ----
+
+            batch.prompt_embeds.append(prompt_embeds_pos)
 
             if batch.do_classifier_free_guidance:
-                batch.negative_prompt_embeds.append(
-                    self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
-                )
+                neg_prompt_embeds = self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+
+                # ---- Cross-platform dump/load: negative prompt embeds ----
+                if _should_dump("encoder_output"):
+                    _dump_tensor("encoder_neg_prompt_embeds", neg_prompt_embeds)
+                if _should_load("encoder_output"):
+                    neg_prompt_embeds = _load_tensor("encoder_neg_prompt_embeds", neg_prompt_embeds)
+                # ---- End ----
+
+                batch.negative_prompt_embeds.append(neg_prompt_embeds)
 
         self.offload_model()
 

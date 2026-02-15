@@ -1,5 +1,6 @@
 import inspect
 import math
+import os
 from typing import List, Optional, Union
 
 import numpy as np
@@ -8,6 +9,53 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+
+# ---- Cross-platform debug: dump/load for pre-DIT stages ----
+_DUMP_DIR = os.environ.get("SGLANG_DUMP_DIR", "")
+_LOAD_DIR = os.environ.get("SGLANG_LOAD_DIR", "")
+_DUMP_POINTS = set(os.environ.get("SGLANG_DUMP_POINTS", "").split(",")) if os.environ.get("SGLANG_DUMP_POINTS") else set()
+_LOAD_POINTS = set(os.environ.get("SGLANG_LOAD_POINTS", "").split(",")) if os.environ.get("SGLANG_LOAD_POINTS") else set()
+
+
+def _should_dump(point):
+    return bool(_DUMP_DIR) and (point in _DUMP_POINTS or "all" in _DUMP_POINTS)
+
+
+def _should_load(point):
+    return bool(_LOAD_DIR) and (point in _LOAD_POINTS or "all" in _LOAD_POINTS)
+
+
+def _dump_value(name, value):
+    if not _DUMP_DIR:
+        return
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    path = os.path.join(_DUMP_DIR, f"{name}.pt")
+    if isinstance(value, torch.Tensor):
+        torch.save(value.detach().cpu(), path)
+        print(f"[DUMP] {name:>40s} | shape={str(list(value.shape)):>30s} | dtype={str(value.dtype):>15s} | → {path}")
+    else:
+        torch.save(value, path)
+        print(f"[DUMP] {name:>40s} | type={type(value).__name__:>15s} | → {path}")
+
+
+def _load_value(name, reference):
+    if not _LOAD_DIR:
+        return reference
+    path = os.path.join(_LOAD_DIR, f"{name}.pt")
+    if not os.path.exists(path):
+        print(f"[LOAD] ⚠️  {name}: file NOT FOUND at {path}, using local value")
+        return reference
+    loaded = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(loaded, torch.Tensor) and isinstance(reference, torch.Tensor):
+        loaded = loaded.to(device=reference.device, dtype=reference.dtype)
+        diff = (loaded.float() - reference.float()).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        status = "✅ MATCH" if max_diff < 1e-5 else ("⚠️  SMALL DIFF" if max_diff < 1e-2 else "❌ LARGE DIFF")
+        print(f"[LOAD] {name:>40s} | shape={str(list(loaded.shape)):>30s} | max_diff={max_diff:.6e} mean_diff={mean_diff:.6e} | {status}")
+    else:
+        print(f"[LOAD] {name:>40s} | type={type(loaded).__name__:>15s} | loaded from {path}")
+    return loaded
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -447,6 +495,21 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             prompt_image, use_en_prompt=use_en_prompt, device=device
         )
 
+        # ---- Cross-platform dump/load: caption ----
+        if _should_dump("caption"):
+            _dump_value("caption_text", prompt)
+            print(f"[DUMP] caption_text: \"{prompt[:200]}{'...' if len(prompt) > 200 else ''}\"")
+        if _should_load("caption"):
+            loaded_caption = _load_value("caption_text", prompt)
+            if loaded_caption != prompt:
+                print(f"[LOAD] ❌ CAPTION MISMATCH!")
+                print(f"[LOAD]   Local:  \"{prompt[:200]}\"")
+                print(f"[LOAD]   Loaded: \"{loaded_caption[:200]}\"")
+            else:
+                print(f"[LOAD] ✅ CAPTION MATCH: \"{prompt[:100]}...\"")
+            prompt = loaded_caption
+        # ---- End cross-platform dump/load ----
+
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt=prompt,
             device=device,
@@ -456,6 +519,19 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             prompt=batch.negative_prompt,
             device=device,
         )
+
+        # ---- Cross-platform dump/load: encoder outputs ----
+        if _should_dump("encoder_output"):
+            _dump_value("prompt_embeds", prompt_embeds)
+            _dump_value("prompt_embeds_mask", prompt_embeds_mask)
+            _dump_value("negative_prompt_embeds", negative_prompt_embeds)
+            _dump_value("negative_prompt_embeds_mask", negative_prompt_embeds_mask)
+        if _should_load("encoder_output"):
+            prompt_embeds = _load_value("prompt_embeds", prompt_embeds)
+            prompt_embeds_mask = _load_value("prompt_embeds_mask", prompt_embeds_mask)
+            negative_prompt_embeds = _load_value("negative_prompt_embeds", negative_prompt_embeds)
+            negative_prompt_embeds_mask = _load_value("negative_prompt_embeds_mask", negative_prompt_embeds_mask)
+        # ---- End cross-platform dump/load ----
 
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, image_latents = self.prepare_latents(
