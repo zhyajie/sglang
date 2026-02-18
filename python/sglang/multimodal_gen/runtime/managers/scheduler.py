@@ -18,14 +18,15 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    StartProfileReq,
+    StopProfileReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
     ShutdownReq,
-    StartProfileReq,
-    StopProfileReq,
     UnmergeLoraWeightsReq,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
