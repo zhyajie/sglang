@@ -231,7 +231,7 @@ def vit_attention_forward(
         value = value.transpose(0, 1).unsqueeze(0)
         
         # Process each sequence segment
-        split_indices = cu_seqlens[1:-1].to("cpu")
+        split_indices = cu_seqlens[1:-1].to(dtype=torch.long, device="cpu")
         q_splits = torch.tensor_split(query, split_indices, dim=2)
         k_splits = torch.tensor_split(key, split_indices, dim=2)
         v_splits = torch.tensor_split(value, split_indices, dim=2)
@@ -799,27 +799,23 @@ class VisionRotaryEmbeddingWithCache(nn.Module):
         self._build_cache(max_position)
     
     def _build_cache(self, max_position: int):
-        """Build cos/sin cache for positions up to max_position."""
+        """Build freqs cache for positions up to max_position."""
         t = torch.arange(max_position, dtype=self.inv_freq.dtype)
         freqs = torch.outer(t, self.inv_freq)
-        # [max_position, dim]
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos_cache = emb.cos()
-        sin_cache = emb.sin()
-        self.register_buffer("cos_cache", cos_cache, persistent=False)
-        self.register_buffer("sin_cache", sin_cache, persistent=False)
-    
-    def get_cos_sin(self, max_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Get pre-computed cos/sin for positions up to max_size."""
+        # Store raw freqs [max_position, dim/2] - do NOT cat here
+        # to preserve correct layout when indexed by 2D pos_ids
+        self.register_buffer("freqs_cache", freqs, persistent=False)
+
+    def get_freqs(self, max_size: int) -> torch.Tensor:
+        """Get pre-computed freqs for positions up to max_size."""
         if max_size > self.max_position:
-            # Extend cache if needed
             self._build_cache(max_size)
-        return self.cos_cache[:max_size], self.sin_cache[:max_size]
-    
+            self.max_position = max_size
+        return self.freqs_cache[:max_size]
+
     def forward(self, max_grid_size: int) -> torch.Tensor:
-        """Return full embedding for compatibility with HuggingFace interface."""
-        cos, sin = self.get_cos_sin(max_grid_size)
-        return cos
+        """Return freqs for compatibility with HuggingFace interface."""
+        return self.get_freqs(max_grid_size)
 
 
 def cast_overflow_tensors(x: torch.Tensor) -> torch.Tensor:
@@ -843,6 +839,25 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.config = config
         if getattr(self.config, "_attn_implementation", None) is None:
             self.config._attn_implementation = "flash_attention_2"
+
+        # On AMD/ROCm GPUs, SDPA (MIOpen backend) computes softmax in bf16,
+        # causing severe precision degradation after 32 ViT layers (cosine_sim
+        # drops to ~0.55). Fall back to eager attention which uses fp32 softmax.
+        if self.config._attn_implementation != "eager":
+            try:
+                if torch.cuda.is_available():
+                    props = torch.cuda.get_device_properties(0)
+                    if "gfx" in getattr(props, "gcnArchName", ""):
+                        logger.warning(
+                            "AMD GPU detected. Overriding ViT attention from "
+                            f"'{self.config._attn_implementation}' to 'eager' "
+                            "to avoid SDPA bf16 softmax precision issues in "
+                            "deep ViT (32 layers)."
+                        )
+                        self.config._attn_implementation = "eager"
+            except Exception:
+                pass
+
         self.spatial_merge_size = config.spatial_merge_size
         self.patch_size = config.patch_size
         self.fullatt_block_indexes = config.fullatt_block_indexes
@@ -907,12 +922,14 @@ class Qwen2_5_VisionTransformer(nn.Module):
         
         pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
         max_size = max(h, w)
-        
-        # Use pre-computed cos/sin cache
-        cos, sin = self.rotary_pos_emb.get_cos_sin(max_size)
-        
-        cos_combined = cos[pos_ids].flatten(1)
-        sin_combined = sin[pos_ids].flatten(1)
+
+        # Match HuggingFace layout: index raw freqs, flatten, then cat+cos/sin
+        # HF: freqs[pos_ids] -> [N, 2, d/2] -> flatten -> [N, d] -> cat(x,x) -> [N, 2d] -> cos/sin
+        freqs = self.rotary_pos_emb.get_freqs(max_size)
+        rotary_pos_emb = freqs[pos_ids].flatten(1)  # [N, 2, d/2] -> [N, d]
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)  # [N, 2d]
+        cos_combined = emb.cos()
+        sin_combined = emb.sin()
         
         # Reshape for spatial merge unit
         cos_combined = cos_combined.reshape(
