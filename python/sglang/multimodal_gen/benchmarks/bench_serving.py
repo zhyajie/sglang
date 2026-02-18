@@ -740,12 +740,16 @@ async def benchmark(args):
     except Exception as e:
         logger.info(f"Failed to fetch model info: {e}. Using default: {args.model}")
 
-    task_name = model_info(args.model).pipeline_tag
-
-    if args.task != task_name:
-        logger.warning(
-            f"Task from args {args.task} is different from huggingface pipeline_tag {task_name}, args.task will be ignored!"
-        )
+    # Try to get pipeline_tag from HuggingFace, but fall back to args.task for local paths
+    try:
+        task_name = model_info(args.model).pipeline_tag
+        if args.task != task_name:
+            logger.warning(
+                f"Task from args {args.task} is different from huggingface pipeline_tag {task_name}, args.task will be ignored!"
+            )
+    except Exception as e:
+        logger.info(f"Could not fetch model info from HuggingFace ({e}), using task from args: {args.task}")
+        task_name = args.task
 
     if task_name in ("text-to-video", "image-to-video", "video-to-video"):
         api_url = f"{args.base_url}/v1/videos"
