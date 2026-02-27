@@ -1,7 +1,8 @@
 # SGLang Diffusion Attention: Principles, Accuracy, and Performance
 
-> Version: v3.1 | Date: 2026-02-27
+> Version: v3.2 | Date: 2026-02-27
 > Scope: In-depth analysis of 6 advanced attention algorithms in SGLang's multimodal diffusion pipeline — **algorithmic principles, accuracy impact mechanisms, and performance characteristics**
+> Update: v3.2 — Added AMD MI300X benchmark results (STA Triton vs SDPA); cross-platform Triton kernel validated on ROCm/HIP
 > Update: v3.1 — Added B200 benchmark results (STA Triton vs FA4 vs SDPA); documented Blackwell compatibility status
 
 ---
@@ -1476,7 +1477,8 @@ Priority ranking (based on usage frequency + development complexity):
   P0 (Must):  SageAttn v2     — Most universal, plug-and-play
   P0 (Must):  FlashAttention  — Foundation dependency for VMoBA and FA backends
   P1 (High):  SLA             — Triton may natively support ROCm
-  P1 (High):  STA             — Requires full kernel development
+  ✅ DONE:    STA (Triton)    — Cross-platform Triton kernel validated on MI300X (7–14× speedup)
+  P1 (High):  STA (CUDA)      — Native CUDA kernel needs ROCm/HIP port for peak performance
   P2 (Med):   VSA             — Needs variable-block attention kernel
   P2 (Med):   SageSLA         — Needs full quantized kernel suite
   P3 (Low):   VMoBA           — Quick port once FA is available
@@ -1685,21 +1687,134 @@ Attention FLOPs formula: **FLOPs = 4 × B × H × N² × d** (Q@K^T + P@V matmul
 ```
 tests/bench_sta_perf.py    — STA Triton vs FA4 vs SDPA benchmark (+ FA3 compatibility test)
 tests/test_sta_kernel.py   — pytest-based correctness + benchmark tests
-tests/st_attn_triton.py    — Triton STA kernel (cross-platform)
+tests/st_attn_triton.py    — Triton STA kernel (cross-platform: CUDA + ROCm/HIP)
 ```
 
 **How to run**:
 ```bash
+# NVIDIA GPUs
 python tests/bench_sta_perf.py --warmup 5 --repeat 20 --output sta_benchmark_B200.json
+
+# AMD GPUs (MI300X) — same Triton kernel, auto-detects HIP backend
+python tests/bench_sta_perf.py --warmup 5 --repeat 20 --output sta_benchmark_MI300X.json
 ```
 
 The script will:
-1. Auto-detect FA4 and FA3 availability
+1. Auto-detect FA4 and FA3 availability (NVIDIA-only; skipped on AMD)
 2. Benchmark all available backends (SDPA, FA4, STA Triton) across 3 shapes
 3. Compute TFLOPS for each configuration
 4. Save results to JSON
 
-Raw results: `sta_benchmark_B200_full.json`
+> **Note**: The `st_attn_triton.py` kernel includes `is_hip()` and `is_cdna3_cdna4()` detection (lines 13–26) with AMD-specific autotuning (`num_stages` limited to `[1, 2]` on CDNA). No code changes needed for AMD.
+
+Raw results: `sta_benchmark_B200_full.json`, `sta_benchmark_MI300X.json`
+
+### 11.9 AMD MI300X Benchmark Results
+
+#### 11.9.1 Test Environment (MI300X)
+
+| Item | Detail |
+|------|--------|
+| **GPU** | AMD Instinct MI300X (gfx942, CDNA 3, 80 CUs) |
+| **GPU Memory** | 192 GB HBM3 |
+| **ROCm** | 7.0 |
+| **PyTorch** | 2.9.0a0+git7bcbafe (ROCm) |
+| **Triton** | 3.4.0 (HIP backend) |
+| **Precision** | BF16 |
+| **Batch size** | 1 |
+| **Heads / Head dim** | 24 / 128 |
+| **Warmup / Repeat** | 5 / 20 |
+
+> **Key finding**: The STA Triton kernel (`st_attn_triton.py`) already includes `is_hip()` and `is_cdna3_cdna4()` detection with AMD-specific `num_stages` limits. The kernel runs **out-of-the-box** on MI300X via Triton's ROCm/HIP backend — no code changes required.
+
+#### 11.9.2 Backends Tested (MI300X)
+
+| Backend | Description | MI300X Status |
+|---------|-------------|---------------|
+| **PyTorch SDPA** | `F.scaled_dot_product_attention` — baseline | Works |
+| **STA Triton** | `sliding_tile_attention_triton` — cross-platform Triton kernel | **Works** |
+| **FA4 / FA3** | NVIDIA-only (CUDA cubins) | **N/A** on AMD |
+| **STA CUDA** | `st_attn` — NVIDIA CUDA kernel | **N/A** on AMD |
+
+#### 11.9.3 STA Triton vs SDPA — Latency & TFLOPS (MI300X)
+
+##### HunyuanVideo 5s 720P — `30x48x80` (115,456 tokens, Dense = 163.80 TFLOP)
+
+| Method | Window | Latency (ms) | Speedup | TFLOPS | Mem (MB) | Sparsity |
+|--------|--------|:------------:|:-------:|:------:|:--------:|:--------:|
+| **SDPA** (baseline) | full | 2,414.0 | 1.00x | **68** | 2,717 | — |
+| **STA Triton full** | (5,6,10) | 2,306.1 | 1.05x | 71 | 5,418 | 0% |
+| **STA Triton sparse** | (3,3,3) | 239.8 | **10.07x** | 61 | 6,096 | 91% |
+| **STA Triton sparse** | (1,3,10) | 260.1 | 9.28x | 63 | 6,096 | 90% |
+| **STA Triton sparse** | (3,1,10) | 260.8 | 9.26x | 63 | 6,096 | 90% |
+| **STA Triton sparse** | (1,5,7) | 298.8 | 8.08x | 64 | 6,096 | 88% |
+| **STA Triton sparse** | (3,6,1) | **171.1** | **14.11x** | 57 | 6,096 | 94% |
+
+##### StepVideo — `36x48x48` (82,944 tokens, Dense = 84.54 TFLOP)
+
+| Method | Window | Latency (ms) | Speedup | TFLOPS | Mem (MB) | Sparsity |
+|--------|--------|:------------:|:-------:|:------:|:--------:|:--------:|
+| **SDPA** (baseline) | full | 1,253.7 | 1.00x | **67** | 2,630 | — |
+| **STA Triton full** | (6,6,6) | 1,248.4 | 1.00x | 68 | 3,108 | 0% |
+| **STA Triton sparse** | (3,3,3) | 156.7 | 8.00x | 67 | 2,916 | 88% |
+| **STA Triton sparse** | (1,3,6) | 104.8 | **11.96x** | 67 | 2,916 | 92% |
+| **STA Triton sparse** | (3,1,6) | **105.0** | **11.94x** | 67 | 2,916 | 92% |
+| **STA Triton sparse** | (1,5,6) | 174.1 | 7.20x | 67 | 2,916 | 86% |
+| **STA Triton sparse** | (3,6,1) | 105.3 | 11.91x | 67 | 2,916 | 92% |
+
+##### Wan 5s 480P — `18x48x80` (69,120 tokens, Dense = 58.71 TFLOP)
+
+| Method | Window | Latency (ms) | Speedup | TFLOPS | Mem (MB) | Sparsity |
+|--------|--------|:------------:|:-------:|:------:|:--------:|:--------:|
+| **SDPA** (baseline) | full | 868.6 | 1.00x | **68** | 2,116 | — |
+| **STA Triton full** | (3,6,10) | 819.1 | 1.06x | 72 | 2,516 | 0% |
+| **STA Triton sparse** | (3,3,3) | 123.7 | 7.02x | 71 | 2,436 | 85% |
+| **STA Triton sparse** | (1,3,10) | 136.9 | 6.35x | 71 | 2,436 | 83% |
+| **STA Triton sparse** | (3,1,10) | 137.2 | 6.33x | 71 | 2,436 | 83% |
+| **STA Triton sparse** | (1,5,7) | 160.0 | 5.43x | 71 | 2,436 | 81% |
+| **STA Triton sparse** | (3,6,1) | **83.2** | **10.44x** | 71 | 2,436 | 90% |
+
+#### 11.9.4 STA Correctness on MI300X (Full Window vs SDPA)
+
+| Shape | L2 Relative Error | Cosine Similarity | Max Abs Error | Status |
+|-------|:-----------------:|:-----------------:|:-------------:|:------:|
+| 30×48×80 (HunyuanVideo) | 0.000490 | 1.000001 | 0.000122 | PASS |
+| 36×48×48 (StepVideo) | 0.000526 | 1.000000 | 0.000244 | PASS |
+| 18×48×80 (Wan 480P) | 0.000546 | 1.000000 | 0.000122 | PASS |
+
+> Correctness is even slightly better on MI300X than B200 (L2 ~0.0005 vs ~0.003), likely due to different SDPA backend implementations.
+
+#### 11.9.5 MI300X Key Findings
+
+1. **Sparse STA delivers 5x–14x speedup on MI300X** — significantly higher than B200's 2x–3.8x. This is because MI300X's SDPA baseline is much slower (~68 TFLOPS vs B200's ~1,375 TFLOPS), making the sparsity advantage more pronounced in absolute wall-clock time reduction.
+
+2. **STA Triton full ≈ SDPA on MI300X** — unlike B200 where full STA is 3x slower than SDPA, on MI300X the Triton kernel matches or slightly exceeds SDPA. This suggests MI300X's SDPA is not heavily optimized, leaving room for the Triton kernel to compete.
+
+3. **SDPA achieves only ~68 TFLOPS on MI300X** — approximately **1.4% of MI300X BF16 peak** (~4,900 TFLOPS dense). For comparison, B200 SDPA achieves ~30% of peak. The MI300X SDPA implementation has significant room for optimization (e.g., via CK FlashAttention or tuned Triton FA kernels).
+
+4. **STA Triton TFLOPS (~57–72) is similar to SDPA (~67–68)** — on MI300X, both backends have comparable per-FLOP efficiency since neither is heavily optimized. The speedup comes purely from sparsity (doing less work).
+
+5. **Cross-platform validation successful** — the same `st_attn_triton.py` Triton kernel works on both NVIDIA B200 (CUDA) and AMD MI300X (HIP) without any code changes, confirming Triton's cross-platform portability for attention kernels.
+
+#### 11.9.6 B200 vs MI300X Comparison
+
+```
+                    SDPA Latency (ms)                 STA Sparse (3,3,3) Speedup
+                B200        MI300X    Ratio          B200        MI300X
+HunyuanVideo   119.1       2,414.0    20.3×          2.57×       10.07×
+StepVideo       61.6       1,253.7    20.3×          2.57×        8.00×
+Wan 480P        42.5         868.6    20.4×          2.56×        7.02×
+
+Key insight: B200 SDPA is ~20x faster than MI300X SDPA (heavily optimized CUDA vs
+unoptimized ROCm). But STA sparse speedup ratios are higher on MI300X because both
+SDPA and STA Triton start from a similar low-efficiency baseline.
+
+With optimized AMD FlashAttention (e.g., CK-based FA), MI300X SDPA could potentially
+reach ~500–1000 TFLOPS, which would reduce the STA sparse speedup ratio to 2–4×
+(similar to B200) while improving absolute latency for all backends.
+```
+
+Raw results: `sta_benchmark_MI300X.json`
 
 ---
 
@@ -1976,6 +2091,7 @@ SGLang integrates 6 state-of-the-art attention acceleration algorithms spanning 
 ```
 P0 (Must):    SageAttention v2 + FlashAttention  ← most universal foundation
 P1 (High):    SLA (Triton may natively support ROCm)
-P2 (Medium):  STA + VSA (require kernel development)
+✅ DONE:      STA Triton — validated on MI300X, 7–14× speedup over SDPA
+P2 (Medium):  STA CUDA + VSA (require kernel development for peak perf)
 P3 (Low):     VMoBA (quick port once FA is available)
 ```
