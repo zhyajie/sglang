@@ -34,16 +34,16 @@
   <!-- 3D Latent -->
   <rect x="42" y="118" width="160" height="68" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2" rx="6"/>
   <text x="122" y="141" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e40af">3D Video Latent</text>
-  <text x="122" y="161" text-anchor="middle" font-size="17" font-weight="bold" fill="#1e3a5f">(24, 48, 100)</text>
+  <text x="122" y="161" text-anchor="middle" font-size="17" font-weight="bold" fill="#1e3a5f">(30, 48, 80)</text>
   <text x="122" y="178" text-anchor="middle" font-size="11" fill="#6b7280">115,200 tokens</text>
 
   <!-- Arrow -->
   <line x1="210" y1="152" x2="252" y2="152" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
-  <text x="231" y="144" text-anchor="middle" font-size="10" fill="#6b7280">÷ (6,4,4)</text>
+  <text x="231" y="144" text-anchor="middle" font-size="10" fill="#6b7280">÷ (6,8,8)</text>
 
   <!-- Tile Grid -->
   <rect x="260" y="115" width="250" height="195" fill="#f0fdf4" stroke="#16a34a" stroke-width="1" rx="6"/>
-  <text x="385" y="133" text-anchor="middle" font-size="13" font-weight="bold" fill="#166534">Tile Grid: 4×12×25 = 1,200 tiles</text>
+  <text x="385" y="133" text-anchor="middle" font-size="13" font-weight="bold" fill="#166534">Tile Grid: 5×6×10 = 300 tiles</text>
 
   <!-- Draw 12x18 grid -->
   <g transform="translate(275, 142)">
@@ -109,18 +109,18 @@
 
   <!-- Tile detail -->
   <rect x="42" y="345" width="220" height="95" fill="#fefce8" stroke="#ca8a04" stroke-width="1" rx="6"/>
-  <text x="152" y="365" text-anchor="middle" font-size="14" font-weight="bold" fill="#854d0e">Each Tile = 96 tokens</text>
+  <text x="152" y="365" text-anchor="middle" font-size="14" font-weight="bold" fill="#854d0e">Each Tile = 384 tokens</text>
   <!-- Cube -->
   <g transform="translate(55, 375)">
     <rect x="0" y="12" width="35" height="35" fill="#fef9c3" stroke="#ca8a04" stroke-width="0.8"/>
     <polygon points="0,12 16,2 51,2 35,12" fill="#fde68a" stroke="#ca8a04" stroke-width="0.8"/>
     <polygon points="35,12 51,2 51,37 35,47" fill="#fcd34d" stroke="#ca8a04" stroke-width="0.8"/>
-    <text x="17" y="34" text-anchor="middle" font-size="10" font-weight="bold" fill="#854d0e">4×4</text>
+    <text x="17" y="34" text-anchor="middle" font-size="10" font-weight="bold" fill="#854d0e">8×8</text>
     <text x="43" y="24" text-anchor="middle" font-size="8" fill="#854d0e">t=6</text>
   </g>
   <g transform="translate(120, 378)">
-    <text x="0" y="0" font-size="12" fill="#374151">6 × 4 × 4 = <tspan font-weight="bold" fill="#dc2626">96</tspan> tokens</text>
-    <text x="0" y="16" font-size="11" fill="#6b7280">Q/K/V: [96 × 128]</text>
+    <text x="0" y="0" font-size="12" fill="#374151">6 × 8 × 8 = <tspan font-weight="bold" fill="#dc2626">384</tspan> tokens</text>
+    <text x="0" y="16" font-size="11" fill="#6b7280">Q/K/V: [384 × 128]</text>
     <text x="0" y="30" font-size="11" fill="#6b7280">= FA block size</text>
     <text x="0" y="44" font-size="11" fill="#6b7280">→ 0 mixed blocks</text>
   </g>
@@ -128,10 +128,10 @@
   <!-- Numbers -->
   <rect x="276" y="345" width="235" height="95" fill="#eff6ff" stroke="#2563eb" stroke-width="1" rx="6"/>
   <text x="393" y="365" text-anchor="middle" font-size="14" font-weight="bold" fill="#1e40af">Numbers</text>
-  <text x="290" y="385" font-size="12" fill="#374151">Total tiles: <tspan font-weight="bold">1,200</tspan></text>
+  <text x="290" y="385" font-size="12" fill="#374151">Total tiles: <tspan font-weight="bold">300</tspan></text>
   <text x="290" y="403" font-size="12" fill="#374151">Total tokens: <tspan font-weight="bold">115,200</tspan></text>
-  <text x="290" y="421" font-size="12" fill="#2563eb">Window tiles: <tspan font-weight="bold">108</tspan> (per Q tile)</text>
-  <text x="290" y="437" font-size="12" fill="#dc2626">Sparsity: <tspan font-weight="bold">1 - 108/1200 = 91%</tspan></text>
+  <text x="290" y="421" font-size="12" fill="#2563eb">Window tiles: <tspan font-weight="bold">27</tspan> (per Q tile)</text>
+  <text x="290" y="437" font-size="12" fill="#dc2626">Sparsity: <tspan font-weight="bold">1 - 27/300 = 91%</tspan></text>
 
 
   <!-- ===================================================================== -->
@@ -147,15 +147,15 @@
   <rect x="582" y="70" width="880" height="330" fill="white" rx="8" filter="url(#sh)"/>
   <rect x="582" y="70" width="880" height="34" fill="#7c3aed" rx="8"/>
   <rect x="582" y="88" width="880" height="16" fill="#7c3aed"/>
-  <text x="602" y="93" fill="white" font-size="16" font-weight="bold">Step 2  ·  FlashAttention Loop — Iterate 108 Key Tiles, Skip 1,092</text>
+  <text x="602" y="93" fill="white" font-size="16" font-weight="bold">Step 2  ·  FlashAttention Loop — Iterate 27 Key Tiles, Skip 273</text>
 
   <!-- Main computation flow -->
   <g transform="translate(608, 118)">
     <!-- Q block -->
     <rect x="0" y="24" width="85" height="115" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5" rx="6"/>
     <text x="42" y="50" text-anchor="middle" font-size="14" font-weight="bold" fill="#dc2626">Q_block</text>
-    <text x="42" y="70" text-anchor="middle" font-size="16" font-weight="bold" fill="#991b1b">[96×128]</text>
-    <text x="42" y="90" text-anchor="middle" font-size="11" fill="#991b1b">96 query</text>
+    <text x="42" y="70" text-anchor="middle" font-size="16" font-weight="bold" fill="#991b1b">[384×128]</text>
+    <text x="42" y="90" text-anchor="middle" font-size="11" fill="#991b1b">384 query</text>
     <text x="42" y="103" text-anchor="middle" font-size="11" fill="#991b1b">tokens</text>
     <text x="42" y="128" text-anchor="middle" font-size="10" fill="#9ca3af">(stays in SRAM)</text>
 
@@ -169,10 +169,10 @@
       <rect x="0" y="30" width="50" height="109" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2" rx="5"/>
       <text x="25" y="58" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">K_j.T</text>
       <text x="25" y="78" text-anchor="middle" font-size="12" fill="#1e40af">[128</text>
-      <text x="25" y="92" text-anchor="middle" font-size="12" fill="#1e40af">×96]</text>
+      <text x="25" y="92" text-anchor="middle" font-size="12" fill="#1e40af">×384]</text>
       <rect x="60" y="30" width="50" height="109" fill="#ede9fe" stroke="#7c3aed" stroke-width="1.2" rx="5"/>
       <text x="85" y="58" text-anchor="middle" font-size="13" font-weight="bold" fill="#5b21b6">V_j</text>
-      <text x="85" y="78" text-anchor="middle" font-size="12" fill="#5b21b6">[96</text>
+      <text x="85" y="78" text-anchor="middle" font-size="12" fill="#5b21b6">[384</text>
       <text x="85" y="92" text-anchor="middle" font-size="12" fill="#5b21b6">×128]</text>
     </g>
 
@@ -184,8 +184,8 @@
       <text x="60" y="10" text-anchor="middle" font-size="13" font-weight="bold" fill="#374151">Score Matrix</text>
       <text x="60" y="24" text-anchor="middle" font-size="10" fill="#9ca3af">Q @ K_j.T / √128</text>
       <rect x="0" y="30" width="120" height="109" fill="#fef3c7" stroke="#d97706" stroke-width="1.2" rx="5"/>
-      <text x="60" y="62" text-anchor="middle" font-size="15" font-weight="bold" fill="#92400e">S_j [96×96]</text>
-      <text x="60" y="84" text-anchor="middle" font-size="12" fill="#92400e">9,216 scores</text>
+      <text x="60" y="62" text-anchor="middle" font-size="15" font-weight="bold" fill="#92400e">S_j [384×384]</text>
+      <text x="60" y="84" text-anchor="middle" font-size="12" fill="#92400e">147,456 scores</text>
       <text x="60" y="100" text-anchor="middle" font-size="11" fill="#92400e">per iteration</text>
       <text x="60" y="126" text-anchor="middle" font-size="11" font-weight="bold" fill="#16a34a">100% dense block</text>
     </g>
@@ -196,7 +196,7 @@
     <!-- Online Softmax -->
     <g transform="translate(428, 0)">
       <text x="90" y="10" text-anchor="middle" font-size="13" font-weight="bold" fill="#374151">Online Softmax</text>
-      <text x="90" y="24" text-anchor="middle" font-size="10" fill="#9ca3af">Accumulate across 108 iterations</text>
+      <text x="90" y="24" text-anchor="middle" font-size="10" fill="#9ca3af">Accumulate across 27 iterations</text>
       <rect x="0" y="30" width="180" height="109" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.2" rx="5"/>
       <text x="90" y="54" text-anchor="middle" font-size="12" fill="#166534" font-weight="bold">m = max(m, rowmax(S_j))</text>
       <text x="90" y="72" text-anchor="middle" font-size="12" fill="#166534" font-weight="bold">P_j = exp(S_j - m)</text>
@@ -232,7 +232,7 @@
     <!-- O accumulated -->
     <rect x="0" y="0" width="110" height="55" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.2" rx="5"/>
     <text x="55" y="20" text-anchor="middle" font-size="13" font-weight="bold" fill="#166534">O (accumulated)</text>
-    <text x="55" y="38" text-anchor="middle" font-size="14" font-weight="bold" fill="#166534">[96 × 128]</text>
+    <text x="55" y="38" text-anchor="middle" font-size="14" font-weight="bold" fill="#166534">[384 × 128]</text>
 
     <!-- ÷ -->
     <text x="130" y="32" text-anchor="middle" font-size="22" font-weight="bold" fill="#475569">÷</text>
@@ -240,7 +240,7 @@
     <!-- l -->
     <rect x="148" y="5" width="42" height="45" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2" rx="5"/>
     <text x="169" y="25" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">l</text>
-    <text x="169" y="42" text-anchor="middle" font-size="12" fill="#1e40af">[96]</text>
+    <text x="169" y="42" text-anchor="middle" font-size="12" fill="#1e40af">[384]</text>
 
     <!-- = -->
     <text x="210" y="32" text-anchor="middle" font-size="22" font-weight="bold" fill="#475569">=</text>
@@ -248,7 +248,7 @@
     <!-- Final O -->
     <rect x="228" y="0" width="120" height="55" fill="#fef2f2" stroke="#dc2626" stroke-width="1.2" rx="5"/>
     <text x="288" y="20" text-anchor="middle" font-size="13" font-weight="bold" fill="#dc2626">O_final</text>
-    <text x="288" y="40" text-anchor="middle" font-size="15" font-weight="bold" fill="#991b1b">[96 × 128]</text>
+    <text x="288" y="40" text-anchor="middle" font-size="15" font-weight="bold" fill="#991b1b">[384 × 128]</text>
 
     <!-- Arrow -->
     <line x1="356" y1="28" x2="380" y2="28" stroke="#475569" stroke-width="1.2" marker-end="url(#arr)"/>
@@ -267,13 +267,13 @@
 
   <!-- Notes -->
   <g transform="translate(50, 695)">
-    <text x="0" y="0" font-size="12" fill="#581c87" font-weight="bold">96 queries share the same key tile set:</text>
-    <text x="280" y="0" font-size="12" fill="#475569">each q_i computes independently · each gets unique o_i · data loaded once, serves 96 queries</text>
+    <text x="0" y="0" font-size="12" fill="#581c87" font-weight="bold">384 queries share the same key tile set:</text>
+    <text x="280" y="0" font-size="12" fill="#475569">each q_i computes independently · each gets unique o_i · data loaded once, serves 384 queries</text>
   </g>
 
   <!-- Write back note -->
   <rect x="50" y="718" width="890" height="26" fill="#ede9fe" stroke="#c4b5fd" stroke-width="0.8" rx="4"/>
-  <text x="495" y="735" text-anchor="middle" font-size="12" fill="#5b21b6">Write 96 outputs back to HBM → repeat for all 1,200 Query Tiles</text>
+  <text x="495" y="735" text-anchor="middle" font-size="12" fill="#5b21b6">Write 384 outputs back to HBM → repeat for all 300 Query Tiles</text>
 
   <!-- ===================================================================== -->
   <!-- Key Insight Box (Bottom Center)                                       -->
@@ -287,16 +287,16 @@
   <g transform="translate(1000, 618)">
     <rect x="0" y="0" width="420" height="56" fill="#fef2f2" stroke="#fca5a5" stroke-width="1" rx="5"/>
     <text x="210" y="16" text-anchor="middle" font-size="13" font-weight="bold" fill="#dc2626">Full Attention</text>
-    <text x="12" y="32" font-size="12" fill="#374151" font-family="Consolas, monospace">for j in [0, 1, ..., 1199]:  S_j = Q @ K_j.T / √d</text>
-    <text x="12" y="48" font-size="11" fill="#991b1b" font-weight="bold">→ 1,200 iterations</text>
+    <text x="12" y="32" font-size="12" fill="#374151" font-family="Consolas, monospace">for j in [0, 1, ..., 299]:  S_j = Q @ K_j.T / √d</text>
+    <text x="12" y="48" font-size="11" fill="#991b1b" font-weight="bold">→ 300 iterations</text>
   </g>
 
   <!-- STA code -->
   <g transform="translate(1450, 618)">
     <rect x="0" y="0" width="420" height="56" fill="#f0fdf4" stroke="#86efac" stroke-width="1" rx="5"/>
     <text x="210" y="16" text-anchor="middle" font-size="13" font-weight="bold" fill="#16a34a">STA Window (18, 24, 24)</text>
-    <text x="12" y="32" font-size="12" fill="#374151" font-family="Consolas, monospace">for j in [window_ids]:  # 108  (same matmul)</text>
-    <text x="12" y="48" font-size="11" fill="#166534" font-weight="bold">→ 108 iterations (skip 1,092)</text>
+    <text x="12" y="32" font-size="12" fill="#374151" font-family="Consolas, monospace">for j in [window_ids]:  # 27  (same matmul)</text>
+    <text x="12" y="48" font-size="11" fill="#166534" font-weight="bold">→ 27 iterations (skip 273)</text>
   </g>
 
   <!-- Highlight -->
