@@ -3,6 +3,7 @@
 > Version: v3.3 | Date: 2026-02-27
 > Scope: In-depth analysis of 6 advanced attention algorithms in SGLang's multimodal diffusion pipeline — **algorithmic principles, accuracy impact mechanisms, and performance characteristics**
 > Update: v3.3 — Added NVIDIA H20 benchmark results (STA CUDA vs STA Triton vs FA3 vs SDPA); first platform with native STA CUDA kernel validation
+> Update: v3.3 — STA CUDA recompilation attempt on B200: confirmed ISA-level incompatibility (Hopper WGMMA → Blackwell TCGEN05); added measured FA4 benchmark data replacing estimates
 > Update: v3.2 — Added AMD MI300X benchmark results (STA Triton vs SDPA); cross-platform Triton kernel validated on ROCm/HIP
 > Update: v3.1 — Added B200 benchmark results (STA Triton vs FA4 vs SDPA); documented Blackwell compatibility status
 
@@ -1513,10 +1514,10 @@ Priority ranking (based on usage frequency + development complexity):
 | **PyTorch SDPA** | `F.scaled_dot_product_attention` — baseline | Works |
 | **FA4 (FlashAttention v4)** | `sglang.jit_kernel.flash_attention_v4` via sgl-kernel | Works |
 | **STA Triton** | `sliding_tile_attention_triton` from FastVideo — cross-platform Triton kernel | Works |
-| **STA CUDA** | `st_attn` v0.0.7 — native CUDA kernel compiled for H100 (SM 90) | **Fails on B200** (PTX JIT error, produces all-zeros) |
+| **STA CUDA** | `st_attn` v0.0.7 — native CUDA kernel compiled for H100 (SM 90) | **Fails on B200** (ISA incompatible: WGMMA removed in SM 100, see 11.2.3) |
 | **FA3 (sgl-kernel)** | `sgl_kernel.flash_attn` — `flash_ops.abi3.so` has sm_80/86/90a cubins only | **Cannot run** on SM 10.0 (no cubin, no PTX) |
 
-> **Note**: The STA CUDA kernel (`st_attn v0.0.7`) is compiled exclusively for SM 90 (H100/H200). On B200 (SM 10.0), PTX JIT compilation fails silently and the kernel produces zero-valued output. The Triton STA kernel is used as a cross-platform alternative. The optimized CUDA kernel on H100 would be significantly faster (paper reports up to 10.45x at 90% sparsity).
+> **Note**: The STA CUDA kernel (`st_attn v0.0.7`) uses ThunderKittens (TK) library with Hopper WGMMA instructions that are **removed in Blackwell** (see [11.2.3](#1123-sta-cuda-on-b200--isa-level-incompatibility-verified)). This is not a build configuration issue — it is an ISA-level incompatibility. The Triton STA kernel is the recommended cross-platform alternative.
 
 #### 11.2.1 FA3 on B200 — Cannot Work (Binary Verification)
 
@@ -1548,6 +1549,36 @@ $ cuobjdump --list-elf sgl_kernel/sm100/common_ops.abi3.so
 
 **Summary**: On B200, use `ver=4` (FA4), not `ver=3` (FA3). FA4 confirmed working in this benchmark.
 
+#### 11.2.3 STA CUDA on B200 — ISA-Level Incompatibility (Verified)
+
+Recompilation of the STA CUDA kernel (`st_attn_h100.cu` from [hao-ai-lab/FastVideo](https://github.com/hao-ai-lab/FastVideo)) was attempted with `TORCH_CUDA_ARCH_LIST=10.0a` (`sm_100a` target). **Compilation fails** with PTX assembly errors:
+
+```
+ptxas error: Instruction 'wgmma.mma_async with floating point types' not supported on .target 'sm_100a'
+ptxas error: Instruction 'wgmma.fence' not supported on .target 'sm_100a'
+ptxas error: Instruction 'wgmma.commit_group' not supported on .target 'sm_100a'
+ptxas error: Instruction 'wgmma.wait_group' not supported on .target 'sm_100a'
+ptxas fatal:  Ptx assembly aborted due to errors
+```
+
+**Root cause**: Blackwell (SM 100) **removed** Hopper's WGMMA instruction set and replaced it with TCGEN05 (Tensor Core Gen 5):
+
+| Hopper (SM 90) Instruction | Status in Blackwell (SM 100) | Blackwell Replacement |
+|:---|:---|:---|
+| `wgmma.mma_async` | **Removed** | `tcgen05.mma` |
+| `wgmma.fence` | **Removed** | `tcgen05.fence` |
+| `wgmma.commit_group` | **Removed** | `tcgen05.commit` |
+| `wgmma.wait_group` | **Removed** | `tcgen05.wait` |
+
+The STA CUDA kernel uses ThunderKittens (TK), a template library that emits WGMMA inline PTX via `kittens::warpgroup::mm_ABt()` and `kittens::warpgroup::mma_AB()`. Both `sm_100` (virtual) and `sm_100a` (architecture-specific) targets reject these instructions.
+
+**What would be needed**: ThunderKittens must update its PTX emission layer to use TCGEN05 instructions on SM 100+. This is not a trivial change — it requires updating the core MMA abstraction in TK's codebase. Until then, the **STA Triton kernel** is the only path for STA on Blackwell.
+
+**Other verified facts**:
+- B200 shared memory (232 KB opt-in) ≥ TK's requirement (227 KB) — no shared memory issue
+- TMA (Tensor Memory Accelerator) is available on Blackwell — no data movement issue
+- The incompatibility is exclusively in the compute (MMA) instructions
+
 ### 11.3 Latency Shapes (5s Video)
 
 Latent shapes are derived from model-specific VAE compression:
@@ -1566,8 +1597,8 @@ Latent shapes are derived from model-specific VAE compression:
 
 | Method | Window | Latency (ms) | Speedup | TFLOPS | Mem (MB) | Sparsity |
 |--------|--------|:------------:|:-------:|:------:|:--------:|:--------:|
-| **SDPA** (baseline) | full | 119.06 | 1.00x | **1,376** | 2,706 | — |
-| **FA4** | full | ~119† | ~1.00x† | ~1,376† | ~2,706† | — |
+| **SDPA** (baseline) | full | 119.06 | 1.00x | **1,376** | 3,383 | — |
+| **FA4** | full | 122.74 | ~1.0x | **1,335** | 7,442 | — |
 | **FA3** | full | — | — | — | — | **N/A** (no SM 100 binary, see 11.2.1) |
 | **STA Triton full** | (5,6,10) | 369.60 | 0.32x | 443 | 5,418 | 0% |
 | **STA Triton sparse** | (3,3,3) | **46.40** | **2.57x** | 318 | 6,096 | 91% |
@@ -1581,7 +1612,7 @@ Latent shapes are derived from model-specific VAE compression:
 | Method | Window | Latency (ms) | Speedup | TFLOPS | Mem (MB) | Sparsity |
 |--------|--------|:------------:|:-------:|:------:|:--------:|:--------:|
 | **SDPA** (baseline) | full | 61.63 | 1.00x | **1,372** | 3,299 | — |
-| **FA4** | full | ~62† | ~1.00x† | ~1,372† | ~3,299† | — |
+| **FA4** | full | 63.96 | ~1.0x | **1,322** | 8,054 | — |
 | **FA3** | full | — | — | — | — | **N/A** (no SM 100 binary, see 11.2.1) |
 | **STA Triton full** | (6,6,6) | 193.10 | 0.32x | 438 | 3,108 | 0% |
 | **STA Triton sparse** | (3,3,3) | **24.01** | **2.57x** | 440 | 2,916 | 88% |
@@ -1595,7 +1626,7 @@ Latent shapes are derived from model-specific VAE compression:
 | Method | Window | Latency (ms) | Speedup | TFLOPS | Mem (MB) | Sparsity |
 |--------|--------|:------------:|:-------:|:------:|:--------:|:--------:|
 | **SDPA** (baseline) | full | 42.45 | 1.00x | **1,383** | 2,596 | — |
-| **FA4** | full | ~42† | ~1.00x† | ~1,383† | ~2,596† | — |
+| **FA4** | full | 44.43 | ~1.0x | **1,321** | 6,410 | — |
 | **FA3** | full | — | — | — | — | **N/A** (no SM 100 binary, see 11.2.1) |
 | **STA Triton full** | (3,6,10) | 108.24 | 0.39x | 542 | 2,516 | 0% |
 | **STA Triton sparse** | (3,3,3) | **16.61** | **2.56x** | 530 | 2,436 | 85% |
@@ -1604,7 +1635,7 @@ Latent shapes are derived from model-specific VAE compression:
 | **STA Triton sparse** | (1,5,7) | 21.41 | 1.98x | 532 | 2,436 | 81% |
 | **STA Triton sparse** | (3,6,1) | **11.25** | **3.77x** | 522 | 2,436 | 90% |
 
-> † FA4 on B200 uses the same underlying FlashAttention implementation as SDPA for this shape; latency is nearly identical. FA4's primary advantage is its `varlen` interface for heterogeneous batches, not raw single-sequence speed vs SDPA. FA4 confirmed working on B200 (uses `sm100/common_ops.abi3.so` with native `sm_100a` cubins).
+> FA4 latency measured from a dedicated FA4 vs SDPA benchmark (separate from STA benchmark run, so SDPA baselines may differ slightly due to benchmark variance). FA4 ≈ SDPA in throughput (~1,320 TFLOPS). The higher memory usage (e.g. 7,442 MB vs 3,383 MB for HunyuanVideo) is due to transpose+contiguous copies in the benchmark harness, not inherent to FA4. FA4's primary advantage is the `varlen` interface for heterogeneous batches in serving scenarios.
 >
 > FA3 (`sgl_kernel.flash_attn` ver=3) **cannot run on B200** — `flash_ops.abi3.so` only contains `sm_80/sm_86/sm_90a` cubins with no PTX fallback (see [11.2.1](#1121-fa3-on-b200--cannot-work-binary-verification)). Use FA4 (`ver=4`) on Blackwell.
 
@@ -1626,11 +1657,11 @@ The tiny error (L2 < 0.004, cosine > 0.9999) is due to BF16 floating-point round
 
 2. **Full-window STA CUDA is ~0.93x SDPA on H20** — only 7% slower than SDPA for full attention. In contrast, STA Triton full is ~0.83–0.87x SDPA. This validates that the CUDA kernel's optimized tile processing nearly matches FlashAttention-level efficiency.
 
-3. **FA4 ≈ SDPA on B200 for single-batch dense attention** — both use optimized CUDA backends. FA4's advantage is the `varlen` interface for heterogeneous sequence lengths in batch serving, not raw throughput for uniform dense attention.
+3. **FA4 ≈ SDPA on B200 for single-batch dense attention** — FA4 achieves ~1,320 TFLOPS vs SDPA's ~1,375 TFLOPS (within benchmark variance). FA4's primary advantage is the `varlen` interface for heterogeneous sequence lengths in batch serving.
 
 4. **FA3 cannot run on B200** — `flash_ops.abi3.so` only ships `sm_80/sm_86/sm_90a` cubins with no PTX. FA4 (`ver=4`) is the official Blackwell FlashAttention path. FA3 **works on H20** (SM 9.0) with ~140 TFLOPS (≈ SDPA speed).
 
-5. **STA CUDA kernel needs Blackwell port** — `st_attn v0.0.7` only ships SM 90 PTX. Recompiling with `CMAKE_CUDA_ARCHITECTURES=100` would enable native B200 support and unlock the full performance potential (paper-claimed 10.45x at 90% sparsity).
+5. **STA CUDA kernel is ISA-incompatible with Blackwell** — the ThunderKittens-based CUDA kernel uses Hopper WGMMA instructions (`wgmma.mma_async`, `wgmma.fence`, etc.) that were **removed in SM 100**. Recompilation with `sm_100a` was attempted and confirmed to fail at the `ptxas` level. A full port to Blackwell's TCGEN05 instruction set is required (see [11.2.3](#1123-sta-cuda-on-b200--isa-level-incompatibility-wgmma--tcgen05)).
 
 6. **Sparse accuracy on random data is not meaningful** — L2 errors of 2–4 on random inputs are expected since random attention weights are uniformly distributed (worst case for sparse attention). On real diffusion model features, >90% of attention mass concentrates within local windows (paper Figure 2), making sparse STA nearly lossless.
 
@@ -1645,6 +1676,7 @@ Attention FLOPs formula: **FLOPs = 4 × B × H × N² × d** (Q@K^T + P@V matmul
 | Method | Window | Sparsity | Eff. TFLOP | Latency (ms) | **TFLOPS** |
 |--------|--------|:--------:|:----------:|:------------:|:----------:|
 | SDPA | full | 0% | 163.80 | 119.06 | **1,376** |
+| FA4 | full | 0% | 163.80 | 122.74 | **1,335** |
 | STA Triton full | (5,6,10) | 0% | 163.80 | 369.60 | **443** |
 | STA Triton sparse | (3,3,3) | 91% | 14.74 | 46.40 | **318** |
 | STA Triton sparse | (1,3,10) | 90% | 16.38 | 49.31 | **332** |
@@ -1657,6 +1689,7 @@ Attention FLOPs formula: **FLOPs = 4 × B × H × N² × d** (Q@K^T + P@V matmul
 | Method | Window | Sparsity | Eff. TFLOP | Latency (ms) | **TFLOPS** |
 |--------|--------|:--------:|:----------:|:------------:|:----------:|
 | SDPA | full | 0% | 84.54 | 61.63 | **1,372** |
+| FA4 | full | 0% | 84.54 | 63.96 | **1,322** |
 | STA Triton full | (6,6,6) | 0% | 84.54 | 193.10 | **438** |
 | STA Triton sparse | (3,3,3) | 88% | 10.57 | 24.01 | **440** |
 | STA Triton sparse | (1,3,6) | 92% | 7.01 | 16.35 | **429** |
@@ -1669,6 +1702,7 @@ Attention FLOPs formula: **FLOPs = 4 × B × H × N² × d** (Q@K^T + P@V matmul
 | Method | Window | Sparsity | Eff. TFLOP | Latency (ms) | **TFLOPS** |
 |--------|--------|:--------:|:----------:|:------------:|:----------:|
 | SDPA | full | 0% | 58.71 | 42.45 | **1,383** |
+| FA4 | full | 0% | 58.71 | 44.43 | **1,321** |
 | STA Triton full | (3,6,10) | 0% | 58.71 | 108.24 | **542** |
 | STA Triton sparse | (3,3,3) | 85% | 8.81 | 16.61 | **530** |
 | STA Triton sparse | (1,3,10) | 83% | 9.80 | 18.48 | **530** |
@@ -1678,13 +1712,13 @@ Attention FLOPs formula: **FLOPs = 4 × B × H × N² × d** (Q@K^T + P@V matmul
 
 #### 11.7.4 TFLOPS Observations
 
-1. **SDPA achieves ~1,375 TFLOPS** consistently across all shapes — approximately **30% of B200 BF16 peak** (~4,500 TFLOPS dense). Attention is memory-bandwidth bound at these sequence lengths, so this utilization is expected.
+1. **SDPA achieves ~1,370–1,383 TFLOPS** across shapes — approximately **30% of B200 BF16 peak** (~4,500 TFLOPS dense). FA4 achieves ~1,320–1,335 TFLOPS (within variance). Attention is memory-bandwidth bound at these sequence lengths, so this utilization is expected.
 
 2. **STA Triton full: 440–540 TFLOPS** (~10–12% of peak). The **3x gap vs SDPA** is entirely Triton kernel overhead (Python-level head loop, unoptimized memory access). The native CUDA kernel on H100 would close this gap significantly.
 
 3. **STA Triton sparse: 280–530 TFLOPS**. Lower TFLOPS than full because smaller tile computations have worse arithmetic intensity. However, **the real win is doing 5–17x less total work** via sparsity, which yields 2–4x wall-clock speedup despite lower per-FLOP efficiency.
 
-4. **Sparse STA on B200 is compute-underutilized** — with a native CUDA kernel compiled for SM 100, sparse STA could potentially achieve 1,000+ TFLOPS at these sparsity levels, pushing speedups to 5–10x over SDPA.
+4. **Sparse STA on B200 is compute-underutilized** — a native CUDA kernel for Blackwell (requiring TCGEN05 port, see [11.2.3](#1123-sta-cuda-on-b200--isa-level-incompatibility-wgmma--tcgen05)) could potentially achieve 1,000+ TFLOPS at these sparsity levels, pushing speedups to 5–10x over SDPA.
 
 ### 11.8 Benchmark Script
 
