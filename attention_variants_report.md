@@ -10,8 +10,9 @@
 1. [Background: Full Attention Performance Bottleneck](#1-background-full-attention-performance-bottleneck)
 2. [Attention Variant Taxonomy & SGLang Support Status](#2-attention-variant-taxonomy--sglang-support-status)
 3. [Deep Dive: Sliding Tile Attention (STA)](#3-deep-dive-sliding-tile-attention-sta)
-4. [Deep Dive: SegAttention](#4-deep-dive-segattention) *(TBD)*
-5. [Future Analysis](#5-future-analysis) *(TBD)*
+4. [Deep Dive: SageAttention](#4-deep-dive-sageattention)
+5. [Deep Dive: SegAttention](#5-deep-dive-segattention) *(TBD)*
+6. [Future Analysis](#6-future-analysis) *(TBD)*
 
 ---
 
@@ -260,17 +261,98 @@ Despite micro-benchmark correctness concerns, the end-to-end FastHunyuan pipelin
 
 ---
 
-## 4. Deep Dive: SegAttention
+## 4. Deep Dive: SageAttention
+
+> **Papers**: SageAttention v1 ([arXiv:2410.02367](https://arxiv.org/abs/2410.02367), ICLR 2025), SageAttention v2 ([arXiv:2411.10958](https://arxiv.org/abs/2411.10958), ICML 2025)
+> **Code**: [thu-ml/SageAttention](https://github.com/thu-ml/SageAttention), AMD implementation in [ROCm/aiter](https://github.com/ROCm/aiter)
+
+### 4.1 Acceleration Principle
+
+Unlike STA (which **skips** computations via sparsity), SageAttention makes **each computation cheaper** by quantizing Q, K, V to low-precision formats before computing attention. The algorithm structure is unchanged — still FlashAttention-style tiled attention with online softmax — but the matrix multiplies use higher-throughput low-precision tensor cores.
+
+SageAttention has two variants, each targeting a different precision–throughput trade-off:
+
+| Variant | Q/K Format | V Format | QK Tensor Core | Throughput vs BF16 |
+|:--------|:-----------|:---------|:---------------|:-------------------|
+| **SageAttn v1** | INT8 | FP8 (e4m3fn) | INT8 MFMA (2x) | ~1.1x |
+| **SageAttn v2 MXFP4** | MXFP4 (e2m1) | FP8 (e4m3fn) | SMFMA (4x) | ~1.3x |
+
+The computation pipeline has two phases:
+
+**Phase 1: Quantization** — Convert BF16 inputs to low-precision with accuracy-preserving techniques:
+- **K Smoothing**: Subtract per-head mean from K along the sequence dimension, centering values around zero to reduce dynamic range
+- **Hadamard Rotation** (MXFP4 only): Apply orthogonal rotation to spread outlier values across all dimensions, preventing a single large dimension from dominating the 4-bit quantization scale
+- **Scale folding**: The softmax scale factor (1/√d) and log2(e) constant are folded into Q's quantization scale, enabling faster `exp2` instead of `exp` in the attention kernel
+
+**Phase 2: Attention** — FlashAttention loop using low-precision tensor cores for both Q@K^T (INT8 or MXFP4) and P@V (FP8), with online softmax in FP32.
+
+The following diagram compares the three approaches side-by-side:
+
+![SageAttention Acceleration Principle](docs/figures/sage_acceleration_principle.png)
+
+**Why the speedup is moderate (~1.1–1.3x) rather than 2–4x**: The theoretical tensor core throughput gain is 2x (INT8) or 4x (MXFP4), but attention is **memory-bandwidth bound** at long sequences — the bottleneck shifts from compute to data movement. The quantization itself also adds overhead (additional kernel launch + memory for scale factors). Nevertheless, on compute-bound configurations (large batch, many heads), SageAttention delivers meaningful speedup with negligible quality loss.
+
+### 4.2 Measured Benchmark Data: AMD MI355X
+
+We benchmarked both SageAttention variants on **AMD MI355X** (gfx950) using the [AITer](https://github.com/ROCm/aiter) Triton implementation. The MXFP4 variant uses the MI355X-specific **SMFMA** (Scaled Matrix Fused Multiply-Add) instructions.
+
+#### Sequence Length Scaling (b=2, h=5, d=128)
+
+| Sequence Length | Sage FP8 Time | Sage FP8 TFLOPS | MXFP4 Time | MXFP4 TFLOPS | Speedup |
+|:---------------:|:-------------:|:---------------:|:----------:|:------------:|:-------:|
+| 8K | 1.18 ms | 288 | 0.91 ms | 376 | 1.29x |
+| 16K | 2.45 ms | 557 | 1.91 ms | 712 | 1.29x |
+| 32K | 5.68 ms | 973 | 4.63 ms | 1,189 | 1.23x |
+| 49K | 11.57 ms | 1,075 | 9.47 ms | 1,334 | 1.22x |
+| 64K | 19.16 ms | 1,150 | 15.45 ms | 1,437 | 1.24x |
+| 76K | 23.41 ms | 1,258 | 20.06 ms | 1,503 | 1.17x |
+| 98K | 41.47 ms | 1,236 | 32.03 ms | 1,565 | 1.29x |
+| 131K | 71.28 ms | 1,235 | 54.64 ms | 1,607 | 1.30x |
+
+![SageAttention Benchmark on MI355X](docs/figures/sage_benchmark_mi355x.png)
+
+#### Ultra-Long Sequences (b=1, h=1, d=128)
+
+| Sequence Length | Sage FP8 TFLOPS | MXFP4 TFLOPS | Speedup |
+|:---------------:|:---------------:|:------------:|:-------:|
+| 131K | 1,115 | 1,486 | 1.20x |
+| 196K | 1,068 | 1,474 | 1.45x |
+| 262K | 1,291 | 1,701 | 1.43x |
+
+> At 262K tokens, MXFP4 achieves **1,701 TFLOPS** — the highest throughput observed. The speedup ratio increases at ultra-long sequences (1.43–1.45x) because the computation becomes more compute-bound, allowing the 4-bit tensor cores to express their throughput advantage.
+
+#### Key Findings
+
+1. **MXFP4 consistently outperforms FP8 by 1.17–1.45x** across all sequence lengths, batch sizes, and head counts tested on MI355X. The speedup is stable and predictable.
+
+2. **MXFP4 peaks at 1,701 TFLOPS** at 262K sequence length — approximately **34% of MI355X BF16 peak** (~5,000 TFLOPS). FP8 peaks at ~1,290 TFLOPS (~26% of peak).
+
+3. **Both variants scale well with sequence length**: TFLOPS increases from 288/376 at 8K to 1,235/1,607 at 131K, showing the expected transition from memory-bound to compute-bound regime.
+
+4. **Batch and head scaling is linear**: No performance degradation as batch size (1→4) or head count (1→8) increases, confirming good GPU occupancy.
+
+### 4.3 Hardware Implications for Custom Operator Development
+
+1. **Low-precision tensor cores are the enabler** — SageAttention's speedup comes entirely from using INT8/MXFP4 tensor cores instead of FP16. Custom operators should support multiple precision modes (FP16, INT8, FP4) with dynamic dispatch based on the workload's compute-vs-bandwidth balance.
+
+2. **Quantization overhead is non-trivial** — The 2-phase pipeline (quant + attention) adds ~10–20% overhead from quantization kernels, scale factor storage, and additional memory transactions. Fusing quantization into the attention kernel (as AITer does for v1) reduces this overhead.
+
+3. **MXFP4 requires hardware-specific support** — The SMFMA instructions (MI355X) and WGMMA FP4 (Blackwell) are not cross-platform. A portable operator needs abstraction layers for different 4-bit matmul instructions, similar to the ISA portability lesson from STA (WGMMA vs TCGEN05).
+
+4. **Per-group scaling is critical for 4-bit accuracy** — MXFP4 uses E8M0 scales per 32 elements; without this fine-grained scaling, 4-bit quantization would be too lossy. Custom operators must support flexible scale granularities (per-tensor, per-block, per-group).
+
+---
+
+## 5. Deep Dive: SegAttention
 
 > *This section is under preparation by a colleague and will be added in a future update.*
 
 ---
 
-## 5. Future Analysis
+## 6. Future Analysis
 
-> *Additional attention variants (SageAttention, VSA, SLA, etc.) will be analyzed following the same structure as Chapter 3:*
+> *Additional attention variants (VSA, SLA, etc.) will be analyzed following the same structure as Chapters 3-4:*
 > - *Acceleration principle*
-> - *Paper benchmark data*
 > - *Measured benchmark data*
 > - *Hardware implications*
 
@@ -284,8 +366,9 @@ Despite micro-benchmark correctness concerns, the end-to-end FastHunyuan pipelin
 | 2 | Accelerating Video Diffusion Transformers (Sparse VideoGen) | [2502.01776](https://arxiv.org/abs/2502.01776) | ICML 2025 |
 | 3 | Analysis of Attention in Video Diffusion Transformers | [2504.10317](https://arxiv.org/abs/2504.10317) | — |
 | 4 | SageAttention: Accurate 8-Bit Attention | [2410.02367](https://arxiv.org/abs/2410.02367) | ICLR 2025 |
-| 5 | FlashAttention: Fast and Memory-Efficient Exact Attention | [2205.14135](https://arxiv.org/abs/2205.14135) | NeurIPS 2022 |
-| 6 | FlashAttention-2: Faster Attention with Better Parallelism | [2307.08691](https://arxiv.org/abs/2307.08691) | ICLR 2024 |
-| 7 | SpargeAttention: Accurate Sparse Attention Accelerating | [2502.18137](https://arxiv.org/abs/2502.18137) | ICML 2025 |
-| 8 | Video Sparse Attention (VSA) | [2505.13389](https://arxiv.org/abs/2505.13389) | — |
-| 9 | Sparse Linear Attention (SLA) | [2509.24006](https://arxiv.org/abs/2509.24006) | — |
+| 5 | SageAttention v2: Efficient Attention with Thorough Outlier Smoothing | [2411.10958](https://arxiv.org/abs/2411.10958) | ICML 2025 |
+| 6 | FlashAttention: Fast and Memory-Efficient Exact Attention | [2205.14135](https://arxiv.org/abs/2205.14135) | NeurIPS 2022 |
+| 7 | FlashAttention-2: Faster Attention with Better Parallelism | [2307.08691](https://arxiv.org/abs/2307.08691) | ICLR 2024 |
+| 8 | SpargeAttention: Accurate Sparse Attention Accelerating | [2502.18137](https://arxiv.org/abs/2502.18137) | ICML 2025 |
+| 9 | Video Sparse Attention (VSA) | [2505.13389](https://arxiv.org/abs/2505.13389) | — |
+| 10 | Sparse Linear Attention (SLA) | [2509.24006](https://arxiv.org/abs/2509.24006) | — |
