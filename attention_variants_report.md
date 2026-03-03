@@ -286,9 +286,15 @@ The computation pipeline has two phases:
 
 **Phase 2: Attention** — FlashAttention loop using low-precision tensor cores for both Q@K^T (INT8 or MXFP4) and P@V (FP8), with online softmax in FP32.
 
-The following diagram compares the three approaches side-by-side:
+The following diagrams illustrate the computation flow for both variants:
 
-![SageAttention Acceleration Principle](docs/figures/sage_acceleration_principle.png)
+**SageAttn v1 (INT8 Q/K + FP8 V)**: K smoothing (mean subtraction) → fused quantization kernel (`sage_quant`: Q→INT8 per-block, K→INT8 per-block, V→FP8 per-channel) → attention kernel (`sage_fwd`: INT8 GEMM for QK, FP8 GEMM for PV)
+
+![SageAttention v1 FP8 Computation Flow](docs/figures/sage_attention_fp8.png)
+
+**SageAttn v2 (MXFP4 Q/K + FP8 V)**: Hadamard rotation + MXFP4 quantization kernel (`_rotate_quantize_qk_kernel`: Q/K→MXFP4 with E8M0 per-32-element scales) → V quantization (`sage_quant_v`: V→FP8 per-channel) → attention kernel (`sage_fwd_mxfp4`: SMFMA for QK, FP8 GEMM for PV)
+
+![SageAttention v2 MXFP4 Computation Flow](docs/figures/sage_attention_mxfp4.png)
 
 **Why the speedup is moderate (~1.1–1.3x) rather than 2–4x**: The theoretical tensor core throughput gain is 2x (INT8) or 4x (MXFP4), but attention is **memory-bandwidth bound** at long sequences — the bottleneck shifts from compute to data movement. The quantization itself also adds overhead (additional kernel launch + memory for scale factors). Nevertheless, on compute-bound configurations (large batch, many heads), SageAttention delivers meaningful speedup with negligible quality loss.
 
