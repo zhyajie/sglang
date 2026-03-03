@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <filter id="shadow" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="2" dy="3" stdDeviation="4" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="500" fill="#ffffff" rx="12"/>
+
+  <!-- Title -->
+  <text x="400" y="38" text-anchor="middle" font-size="20" font-weight="bold" fill="#1e293b">Wan2.2 Single DiT Layer Time Breakdown on AMD MI355X</text>
+  <text x="400" y="58" text-anchor="middle" font-size="13" fill="#94a3b8">Total: 19,506 us per layer</text>
+
+  <!-- Pie chart center -->
+  <!-- MHA: 63.42% = 228.3 degrees, start at 0 -->
+  <!-- GEMM: 18.67% = 67.2 degrees -->
+  <!-- All-to-All: 10.43% = 37.5 degrees -->
+  <!-- Others: 7.48% = 26.9 degrees -->
+
+  <g transform="translate(300, 270)" filter="url(#shadow)">
+    <!-- MHA slice: 0 to 228.3 degrees (63.42%) - Red/Orange -->
+    <path d="M 0 0 L 180 0 A 180 180 0 1 1 -107.7 144.6 Z" fill="#ef4444" stroke="#fff" stroke-width="2"/>
+
+    <!-- GEMM slice: 228.3 to 295.5 degrees (18.67%) - Blue -->
+    <path d="M 0 0 L -107.7 144.6 A 180 180 0 0 1 -77.0 -162.7 Z" fill="#3b82f6" stroke="#fff" stroke-width="2"/>
+
+    <!-- All-to-All slice: 295.5 to 333.0 degrees (10.43%) - Green -->
+    <path d="M 0 0 L -77.0 -162.7 A 180 180 0 0 1 80.4 -161.1 Z" fill="#22c55e" stroke="#fff" stroke-width="2"/>
+
+    <!-- Others slice: 333.0 to 360 degrees (7.48%) - Gray -->
+    <path d="M 0 0 L 80.4 -161.1 A 180 180 0 0 1 180 0 Z" fill="#a78bfa" stroke="#fff" stroke-width="2"/>
+
+    <!-- Labels on pie -->
+    <text x="50" y="50" text-anchor="middle" font-size="22" font-weight="bold" fill="#fff">MHA</text>
+    <text x="50" y="75" text-anchor="middle" font-size="16" fill="#fff">63.42%</text>
+
+    <text x="-115" y="50" text-anchor="middle" font-size="14" font-weight="bold" fill="#fff">GEMM</text>
+    <text x="-115" y="68" text-anchor="middle" font-size="12" fill="#fff">18.67%</text>
+
+    <text x="-15" y="-130" text-anchor="middle" font-size="12" font-weight="bold" fill="#fff">A2A</text>
+    <text x="-15" y="-115" text-anchor="middle" font-size="10" fill="#fff">10.43%</text>
+
+    <text x="120" y="-100" text-anchor="middle" font-size="11" font-weight="bold" fill="#fff">Other</text>
+    <text x="120" y="-86" text-anchor="middle" font-size="9" fill="#fff">7.48%</text>
+  </g>
+
+  <!-- Legend -->
+  <g transform="translate(560, 130)">
+    <rect x="0" y="0" width="210" height="200" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1" rx="8"/>
+    <text x="105" y="24" text-anchor="middle" font-size="14" font-weight="bold" fill="#334155">Component</text>
+    <line x1="15" y1="34" x2="195" y2="34" stroke="#e2e8f0" stroke-width="1"/>
+
+    <!-- MHA -->
+    <rect x="15" y="48" width="16" height="16" fill="#ef4444" rx="3"/>
+    <text x="40" y="62" font-size="13" fill="#334155" font-weight="600">MHA</text>
+    <text x="195" y="62" text-anchor="end" font-size="13" fill="#334155">12,371 us</text>
+
+    <!-- GEMM -->
+    <rect x="15" y="78" width="16" height="16" fill="#3b82f6" rx="3"/>
+    <text x="40" y="92" font-size="13" fill="#334155" font-weight="600">GEMM (FFN)</text>
+    <text x="195" y="92" text-anchor="end" font-size="13" fill="#334155">3,641 us</text>
+
+    <!-- All-to-All -->
+    <rect x="15" y="108" width="16" height="16" fill="#22c55e" rx="3"/>
+    <text x="40" y="122" font-size="13" fill="#334155" font-weight="600">All-to-All</text>
+    <text x="195" y="122" text-anchor="end" font-size="13" fill="#334155">2,034 us</text>
+
+    <!-- Others -->
+    <rect x="15" y="138" width="16" height="16" fill="#a78bfa" rx="3"/>
+    <text x="40" y="152" font-size="13" fill="#334155" font-weight="600">Others</text>
+    <text x="195" y="152" text-anchor="end" font-size="13" fill="#334155">1,460 us</text>
+
+    <line x1="15" y1="170" x2="195" y2="170" stroke="#e2e8f0" stroke-width="1"/>
+    <text x="40" y="188" font-size="13" fill="#334155" font-weight="bold">Total</text>
+    <text x="195" y="188" text-anchor="end" font-size="13" fill="#334155" font-weight="bold">19,506 us</text>
+  </g>
+
+  <!-- Callout arrow for MHA -->
+  <g transform="translate(300, 270)">
+    <line x1="85" y1="-15" x2="170" y2="-65" stroke="#ef4444" stroke-width="2" stroke-dasharray="4,3"/>
+    <rect x="155" y="-100" width="300" height="34" fill="#fef2f2" stroke="#fca5a5" stroke-width="1" rx="6"/>
+    <text x="305" y="-78" text-anchor="middle" font-size="13" fill="#991b1b" font-weight="bold">Attention is the #1 optimization target</text>
+  </g>
+</svg>

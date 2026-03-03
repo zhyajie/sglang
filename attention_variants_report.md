@@ -1,7 +1,6 @@
 # Attention Variants in Multimodal Diffusion Models: Acceleration Principles and Hardware Implications
 
-> **Version**: v1.0 | **Date**: 2026-03-03
-> **Audience**: Technical Management
+> **Version**: v1.1 | **Date**: 2026-03-03
 > **Purpose**: Survey attention acceleration techniques in video/image diffusion models; inform custom operator development planning
 
 ---
@@ -20,31 +19,7 @@
 
 ### 1.1 Why Attention Matters in Diffusion Transformers
 
-Modern video generation models (HunyuanVideo, Wan2.x, CogVideoX) use **Diffusion Transformers (DiT)** as their backbone. Unlike image models, video DiTs process extremely long sequences — a 5-second 720P video produces **115,200 tokens** in the latent space. Since standard attention has **O(N²)** complexity, the cost becomes dominant at these sequence lengths.
-
-```
-                    Attention Cost Growth vs. Other Operations
-
-  Time ▲
-       │                                           ╱  Attention O(N²)
-       │                                         ╱
-       │                                       ╱
-       │                                     ╱
-       │                                  ╱
-       │                               ╱
-       │                           ╱
-       │                       ╱
-       │                  ╱           ─────────── Linear layers O(N)
-       │             ╱       ─────────
-       │         ╱  ────────
-       │     ╱───
-       │ ╱──
-       └───────────────────────────────────────────────► Sequence Length
-             1K    5K    10K   30K   50K   70K  115K
-
-  At 115K tokens (5s 720P video):
-  N² = 13.3 Billion Q-K pairs per attention layer
-```
+Modern video generation models (HunyuanVideo, Wan2.x, CogVideoX) use **Diffusion Transformers (DiT)** as their backbone. Unlike image models, video DiTs process extremely long sequences — a 5-second 720P video produces **115,200 tokens** in the latent space. Since standard attention has **O(N²)** complexity, the cost grows quadratically with sequence length and becomes the dominant bottleneck. At 115K tokens, each attention layer computes **13.3 billion Q-K pairs**.
 
 ### 1.2 Measured Data: Wan2.2 Single-Layer Profiling on AMD MI355X
 
@@ -58,26 +33,7 @@ We profiled a single DiT layer of the **Wan2.2** model on **AMD MI355X**. The re
 | Others      |     1,460 |      7.48% |
 | **Total**   | **19,506**| **100.00%**|
 
-```
-  Wan2.2 Single DiT Layer Time Breakdown (MI355X)
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │                                                                      │
-  │                                                                      │
-  │   ┌─────────────────────────────────────────────┐                    │
-  │   │                                             │                    │
-  │   │               MHA (63.42%)                  │                    │
-  │   │                                             │                    │
-  │   │            12,371 us                        │                    │
-  │   │                                             │                    │
-  │   └─────────────────────────────────────────────┘                    │
-  │                                                                      │
-  │   ┌──────────────────┐  ┌────────┐  ┌──────┐                        │
-  │   │   GEMM (18.67%)  │  │All2All │  │Others│                        │
-  │   │   3,641 us       │  │10.43%  │  │7.48% │                        │
-  │   └──────────────────┘  └────────┘  └──────┘                        │
-  │                                                                      │
-  └──────────────────────────────────────────────────────────────────────┘
-```
+![Wan2.2 Single DiT Layer Time Breakdown on MI355X](docs/figures/mi355x_pie_chart.png)
 
 **Conclusion**: MHA accounts for **63%** of single-layer time. With 30+ transformer layers in a typical DiT, attention is by far the largest optimization target.
 
@@ -92,38 +48,7 @@ Multiple independent papers confirm that attention is the dominant bottleneck:
 | **Analysis of Attention in VDiTs** (arXiv:2504.10317) | Mochi-1 (10B) | — | **~60%** | FLOPS proportion |
 | **Our measurement** | Wan2.2 | MI355X | **63.42%** | Wall-clock (single layer) |
 
-> **Note**: The STA paper reports that generating a 5-second 720P video with HunyuanVideo takes **945 seconds** on a single H100, of which **800 seconds** are spent on attention alone. The Mochi-1 model shows lower attention percentage (~60%) because it uses an Asymmetric DiT architecture with relatively larger FFN layers.
-
-```
-  Attention Time Percentage Across Models & Hardware
-
-  100% ┬─────────────────────────────────────────────
-       │
-   90% ┤
-       │   ████
-   80% ┤   ████   ████
-       │   ████   ████
-   70% ┤   ████   ████
-       │   ████   ████         ████
-   60% ┤   ████   ████         ████   ████
-       │   ████   ████         ████   ████
-   50% ┤   ████   ████         ████   ████
-       │   ████   ████         ████   ████
-   40% ┤   ████   ████         ████   ████
-       │   ████   ████         ████   ████
-   30% ┤   ████   ████         ████   ████
-       │   ████   ████         ████   ████
-   20% ┤   ████   ████         ████   ████
-       │   ████   ████         ████   ████
-   10% ┤   ████   ████         ████   ████
-       │   ████   ████         ████   ████
-    0% ┴───████───████─────────████───████────────────
-       HunyuanVideo HunyuanVideo  Wan2.2  Mochi-1
-         (H100)      (A100)    (MI355X)
-         84.7%       >80%      63.4%     ~60%
-
-  Sources: STA paper, Sparse VideoGen, Our data, Analysis of Attention in VDiTs
-```
+> **Note**: The STA paper reports that generating a 5-second 720P video with HunyuanVideo takes **945 seconds** on a single H100, of which **800 seconds** are spent on attention alone. The Mochi-1 model shows a lower attention percentage (~60%) because it uses an Asymmetric DiT architecture with relatively larger FFN layers.
 
 ### 1.4 Key Takeaway
 
@@ -133,71 +58,11 @@ Across different models and hardware platforms, **attention consistently account
 
 ## 2. Attention Variant Taxonomy & SGLang Support Status
 
-### 2.1 Why So Many Attention Variants?
+### 2.1 Attention Acceleration Approaches
 
-Full attention computes **all** N² query-key interactions, but in video diffusion models, most of these interactions contribute negligibly to the output. Different acceleration strategies exploit this redundancy in different ways:
+Full attention computes **all** N² query-key interactions, but in video diffusion models, most of these interactions contribute negligibly to the output. Different acceleration strategies exploit this redundancy in different ways. We categorize the attention variants in SGLang into **four families**:
 
-```
-  Full Attention                    Accelerated Attention (various strategies)
-  ──────────────                    ─────────────────────────────────────────
-
-  ┌───────────────────┐             Strategy 1: SKIP unnecessary computations
-  │█████████████████│             ┌───────────────────┐
-  │█████████████████│             │███░░░░░░░░░░░░░░│  Spatial Sparsity
-  │█████████████████│             │░░░███░░░░░░░░░░░│  (STA, VSA)
-  │█████████████████│             │░░░░░░███░░░░░░░░│
-  │█████████████████│             └───────────────────┘
-  │█████████████████│
-  │█████████████████│             Strategy 2: CHEAPER computations
-  │█████████████████│             ┌───────────────────┐
-  └───────────────────┘             │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│  Quantization
-  Compute ALL N² pairs              │▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒│  (SageAttention)
-  FP16 precision                    └───────────────────┘  INT8 Q/K, FP16 P·V
-
-  █ = FP16 dense computation                          Strategy 3: REPLACE the algorithm
-  ░ = skipped (zero cost)           ┌───────────────────┐
-  ▒ = INT8 computation (cheaper)    │ Linear(Q)·Linear(K)│  Linear Attention
-                                    └───────────────────┘  (SLA) — O(N) instead of O(N²)
-```
-
-### 2.2 Classification of Attention Acceleration Approaches
-
-We categorize the attention variants in SGLang into **four families** based on their acceleration strategy:
-
-```
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │              Attention Acceleration Taxonomy                        │
-  ├─────────────────────┬───────────────────────────────────────────────┤
-  │                     │                                               │
-  │  ┌───────────────┐  │  ┌───────────────┐                           │
-  │  │ Quantization  │  │  │   Spatial     │                           │
-  │  │   -based      │  │  │   Sparsity   │                           │
-  │  │               │  │  │               │                           │
-  │  │ SageAttention │  │  │ STA           │                           │
-  │  │ SageAttn 3    │  │  │ VSA           │                           │
-  │  │               │  │  │ VMoBA         │                           │
-  │  │ Principle:    │  │  │               │                           │
-  │  │ Same N² ops,  │  │  │ Principle:    │                           │
-  │  │ cheaper each  │  │  │ Skip most     │                           │
-  │  │ (INT8 Q@K)    │  │  │ Q-K pairs     │                           │
-  │  └───────┬───────┘  │  └───────┬───────┘                           │
-  │          │          │          │                                    │
-  │          ▼          │          ▼                                    │
-  │  ┌───────────────┐  │  ┌───────────────┐                           │
-  │  │   Hybrid      │  │  │   Linear      │                           │
-  │  │               │  │  │   Attention   │                           │
-  │  │ SageSLA       │  │  │               │                           │
-  │  │ SpargeAttn    │  │  │ SLA           │                           │
-  │  │               │  │  │               │                           │
-  │  │ Principle:    │  │  │ Principle:    │                           │
-  │  │ Combine       │  │  │ Replace       │                           │
-  │  │ quantization  │  │  │ softmax with  │                           │
-  │  │ + sparsity    │  │  │ linear kernel │                           │
-  │  │ for 2x gains  │  │  │ O(N) cost     │                           │
-  │  └───────────────┘  │  └───────────────┘                           │
-  │                     │                                               │
-  └─────────────────────┴───────────────────────────────────────────────┘
-```
+![Attention Acceleration Taxonomy](docs/figures/attention_taxonomy.png)
 
 #### Category 1: Quantization-Based
 
@@ -231,7 +96,7 @@ We categorize the attention variants in SGLang into **four families** based on t
 - **Speedup**: Multiplicative gains from combining techniques
 - **Trade-off**: More complex implementation; cumulative accuracy impact
 
-### 2.3 SGLang Compatibility Matrix
+### 2.2 SGLang Compatibility Matrix
 
 The table below shows which attention optimizations are supported for each model in **SGLang's diffusion pipeline**:
 
@@ -255,7 +120,7 @@ The table below shows which attention optimizations are supported for each model
 
 > Source: SGLang Diffusion `docs/diffusion/compatibility_matrix.md`
 
-### 2.4 Key Observation
+### 2.3 Key Observation
 
 The compatibility matrix reveals an important pattern: **no single acceleration technique works for all models**. This is because:
 
@@ -274,33 +139,9 @@ This diversity reinforces the need for hardware-level support of multiple attent
 
 ### 3.1 Core Insight: Why STA Can Accelerate Attention
 
-STA is built on a single fundamental observation: **in video diffusion models, attention scores concentrate locally in 3D space**.
+STA is built on a single fundamental observation: **in video diffusion models, attention scores concentrate locally in 3D space**. A small local window covering only ~15% of the total token space captures >70% of attention mass (Paper Figure 2-3, tested across 10 diverse prompts, the pattern is prompt-agnostic).
 
-```
-  Attention Score Distribution in Video DiT (HunyuanVideo)
-  ─────────────────────────────────────────────────────────
-
-  For a query token at position (t, h, w):
-
-  High attention ███     Low attention ░░░     Near-zero ···
-
-                 Time (t) ───────────────────►
-                ┌─────────────────────────────────────┐
-               ╱│░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
-     Height   ╱ │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
-     (h)     ╱  │░░░░░░░░░███████████░░░░░░░░░░░░░░░│
-            ╱   │░░░░░░░░░███████████░░░░░░░░░░░░░░░│
-           ╱    │░░░░░░░░░███████████░░░░░░░░░░░░░░░│
-          ╱     │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
-         ╱      │░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░│
-        ┌───────│─────────────────────────────────────│
-        │       │                                     │
-        └───────│─────────────────────────────────────┘
-                Width (w) ───────────────────►
-
-  > 90% of attention mass falls within a local 3D window
-  (Paper Figure 2-3: tested across 10 diverse prompts, pattern is prompt-agnostic)
-```
+![STA 3D Attention Locality](docs/figures/sta_3d_locality.png)
 
 This means we can **skip computing attention for distant tokens** with minimal quality loss. The question is: **how to skip efficiently on GPU hardware?**
 
@@ -308,150 +149,33 @@ This means we can **skip computing attention for distant tokens** with minimal q
 
 A naive approach (like NATTEN/CLEAR) applies a sliding window at the **token level** — each token has its own window center. But FlashAttention computes at the **block level** (groups of tokens). This mismatch creates three types of blocks:
 
-```
-  Token-Level Sliding Window (NATTEN)     Tile-Level Sliding Window (STA)
-  ────────────────────────────────────     ──────────────────────────────
+| Block Type | Description | GPU Efficiency |
+|:-----------|:------------|:---------------|
+| **Dense** | All scores retained | Efficient — full utilization |
+| **Empty** | All scores masked | Free — skipped entirely |
+| **Mixed** | Partially masked | **INEFFICIENT** — same FLOPs as dense + mask overhead |
 
-  ┌───┬───┬───┬───┬───┬───┐              ┌───┬───┬───┬───┬───┬───┐
-  │ D │ M │   │   │   │   │              │ D │ D │ D │   │   │   │
-  ├───┼───┼───┼───┼───┼───┤              ├───┼───┼───┼───┼───┼───┤
-  │ M │ D │ M │   │   │   │              │ D │ D │ D │ D │   │   │
-  ├───┼───┼───┼───┼───┼───┤              ├───┼───┼───┼───┼───┼───┤
-  │   │ M │ D │ M │   │   │              │   │ D │ D │ D │ D │   │
-  ├───┼───┼───┼───┼───┼───┤              ├───┼───┼───┼───┼───┼───┤
-  │   │   │ M │ D │ M │   │              │   │   │ D │ D │ D │ D │
-  └───┴───┴───┴───┴───┴───┘              └───┴───┴───┴───┴───┴───┘
+At 90% sparsity, NATTEN/CLEAR produce many mixed blocks, resulting in **0.86x** speed (actually **slower** than full attention!). STA's tile-level design guarantees **zero mixed blocks**, achieving **10.45x** speedup at the same sparsity level.
 
-  D = Dense block (efficient)              D = Dense block (efficient)
-  M = Mixed block (INEFFICIENT)            No mixed blocks!
-      Same cost as Dense + mask overhead
-
-  Result at 90% sparsity:                 Result at 90% sparsity:
-  CLEAR achieves 0.86x (SLOWER!)          STA achieves 10.45x speedup
-```
-
-**Why mixed blocks kill performance**: A mixed block has some tokens inside the window and some outside. The GPU must still compute the full block (same FLOPs as dense) and then apply a mask. This means **mixed blocks cost MORE than dense blocks** — they pay full compute plus mask overhead.
-
-**STA's solution**: Group tokens into **tiles** first, then apply the sliding window at the **tile level**. All tokens in the same tile share the same window center, so every block is either fully inside (dense) or fully outside (empty). **Zero mixed blocks**.
+**STA's solution**: Group tokens into **tiles** first, then apply the sliding window at the **tile level**. All tokens in the same tile share the same window center, so every block is either fully inside (dense) or fully outside (empty).
 
 ### 3.3 STA Computation Flow
 
 The following diagram illustrates the complete STA computation pipeline using HunyuanVideo 720P 5s as a concrete example:
 
-![STA Computation Flow](docs/figures/sta_computation_flow_ppt.svg)
+![STA Computation Flow](docs/figures/sta_computation_flow_ppt.png)
 
-#### Step 1: 3D Video Latent → Tile Grid
+The pipeline consists of four steps:
 
-```
-  Input: 3D Video Latent
+**Step 1: 3D Video Latent → Tile Grid** — The 3D video latent (30×48×80 = 115,200 tokens) is partitioned into tiles of size 6×8×8 = 384 tokens each, producing a 5×6×10 = 300 tile grid. Tokens within the same tile are rearranged to have consecutive IDs (via einops), so each tile maps exactly to one FlashAttention block — guaranteeing zero mixed blocks.
 
-  ┌────────────────────────────────────────┐
-  │                                        │
-  │     30 × 48 × 80 = 115,200 tokens     │    ÷ tile size (6, 8, 8)
-  │     (Time × Height × Width)            │    ─────────────────────►
-  │                                        │
-  └────────────────────────────────────────┘
+**Step 2: Determine Window Key Tiles** — For each Query Tile, the 3D sliding window determines which Key Tiles to attend to. With window (3,3,3) tiles, each query attends to only 27 out of 300 tiles (91% sparsity). The remaining 273 tiles are skipped entirely at zero cost.
 
-                                    Tile Grid: 5 × 6 × 10 = 300 tiles
+**Step 3: FlashAttention Loop** — The Q block [384×128] is loaded into SRAM and stays for all iterations. The kernel loops over only the 27 window Key Tiles (instead of 300), loading K_j and V_j from HBM, computing scores S_j = Q @ K_j.T / √d, applying online softmax, and accumulating the output. Every block is 100% dense — no masking overhead.
 
-                                    ┌────────────────────────────────┐
-                                    │  Each tile = 6 × 8 × 8        │
-                                    │            = 384 tokens        │
-                                    │                                │
-                                    │  Q/K/V block: [384 × 128]     │
-                                    │                                │
-                                    │  Tile boundary = FA block      │
-                                    │  boundary → 0 mixed blocks     │
-                                    └────────────────────────────────┘
+**Step 4: Normalize & Output** — After the loop, O_final = O / l produces 384 output vectors. These are written back to HBM, and the process repeats for all 300 Query Tiles.
 
-  Key property: tokens within the same tile get consecutive IDs
-  (via einops rearrange), so each tile maps to exactly one
-  FlashAttention block.
-```
-
-#### Step 2: Determine Window Key Tiles per Query Tile
-
-For each Query Tile, determine which Key Tiles are within the 3D sliding window:
-
-```
-  Example: Tile Grid 5 × 6 × 10, Window = (3, 3, 3) tiles
-
-  Query Tile at position (2, 3, 5):
-    T-window: [1, 2, 3]     → 3 tiles
-    H-window: [2, 3, 4]     → 3 tiles
-    W-window: [4, 5, 6]     → 3 tiles
-    Window tiles: 3 × 3 × 3 = 27 tiles
-
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                    Tile Grid (viewed from T axis)                │
-  │                                                                  │
-  │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░█████████████░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░█████████████░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░████ Q ██████░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░█████████████░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░         │
-  │                                                                  │
-  │    ░ = Skip (273 tiles)    █ = Window key tiles (27 tiles)       │
-  │    Q = Query tile          Sparsity = 1 - 27/300 = 91%          │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-#### Step 3: FlashAttention Loop — Iterate Only Window Tiles
-
-```
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  Q_block [384×128] loaded into SRAM (stays for all iterations)           │
-  │                                                                          │
-  │  for j in [0, 1, ..., 26]:    ◄── only 27 iterations (not 300!)        │
-  │  ┌────────────────────────────────────────────────────────────────────┐  │
-  │  │                                                                    │  │
-  │  │  ① Load K_j [384×128] and V_j [384×128] from HBM → SRAM          │  │
-  │  │                                                                    │  │
-  │  │  ② Score: S_j = Q_block @ K_j.T / √128                           │  │
-  │  │     [384×128] @ [128×384] = S_j [384×384]                         │  │
-  │  │     → 147,456 scores per iteration                                │  │
-  │  │     → 100% dense block (no masking needed!)                       │  │
-  │  │                                                                    │  │
-  │  │  ③ Online Softmax (incremental, no full P matrix):                │  │
-  │  │     m = max(m, rowmax(S_j))                                       │  │
-  │  │     P_j = exp(S_j - m)                                           │  │
-  │  │     l = rescale(l) + rowsum(P_j)                                  │  │
-  │  │                                                                    │  │
-  │  │  ④ Accumulate: O = rescale(O) + P_j @ V_j                        │  │
-  │  │     [384×384] @ [384×128] → O [384×128]                           │  │
-  │  │                                                                    │  │
-  │  └───────────────────────────────────────┬────────────────────────────┘  │
-  │                                          │                               │
-  │                   next j ◄───────────────┘                               │
-  │                                                                          │
-  │  After loop: O_final = O / l    → 384 output vectors [384×128]          │
-  │  Write O_final back to HBM → Repeat for all 300 Query Tiles             │
-  └──────────────────────────────────────────────────────────────────────────┘
-```
-
-#### The Core Difference: Loop Count Only
-
-```
-  ┌──────────────────────────────────┐    ┌──────────────────────────────────┐
-  │         Full Attention            │    │       STA (91% sparsity)         │
-  │                                   │    │                                  │
-  │  for j in [0, 1, ..., 299]:      │    │  for j in [window_ids]:  # 27   │
-  │      S_j = Q @ K_j.T / √d       │    │      S_j = Q @ K_j.T / √d      │
-  │                                   │    │                                  │
-  │  → 300 iterations                │    │  → 27 iterations                │
-  │  → 300 × 147,456 = 44.2M scores │    │  → 27 × 147,456 = 4.0M scores  │
-  │                                   │    │                                  │
-  │  The per-iteration matmul is     │    │  ← IDENTICAL matmul             │
-  │  EXACTLY THE SAME                │    │  Just fewer iterations           │
-  └──────────────────────────────────┘    └──────────────────────────────────┘
-
-  Speedup source: purely from reducing iteration count
-  No algorithm change, no approximation in the matmul itself
-```
+**The core difference from full attention is purely the loop count**: full attention iterates 300 times, STA iterates 27 times. The per-iteration matmul is identical. STA's speedup comes entirely from reducing the number of iterations.
 
 ### 3.4 Paper Benchmark Data
 
@@ -460,196 +184,79 @@ For each Query Tile, determine which Key Tiles are within the 3D sliding window:
 | Method | Sparsity | VBench Total | Quality | Speedup | Notes |
 |:-------|:--------:|:------------:|:-------:|:-------:|:------|
 | HunyuanVideo (FA3) | 0% | 82.71% | 85.34% | 1.0x | Baseline |
-| CLEAR (r=32) | ~90% | 82.37% | 84.41% | **0.37x** (slower!) | Mixed blocks kill perf |
-| Tiled NATTEN (w=30,41,41) | ~90% | 82.69% | 84.61% | **0.51x** (slower!) | Mixed blocks |
 | STA training-free | — | 82.46% | 84.63% | 1.79x | No fine-tuning needed |
 | **STA finetuned** | — | **83.00%** | **85.37%** | **2.44x** | Improves quality! |
 | **STA finetuned** | ~91% | **82.62%** | **84.76%** | **3.53x** | Only -0.09% VBench |
 
 > Key result: At 91% sparsity, STA achieves **3.53x end-to-end speedup** with only 0.09% quality degradation. Competing methods (CLEAR, NATTEN) are actually **slower than full attention** at the same sparsity level due to mixed block overhead.
 
-#### Block Pattern Comparison (Paper Table 1)
-
-| Window Size (3D) | Method | Dense Block % | Mixed Block % |
-|:---:|:---:|:---:|:---:|
-| (11,11,11) | Tiled NATTEN | 0.06% | **7.17%** |
-| (12,12,12) | **STA** | 1.56% | **0.0%** |
-| (20,20,20) | **STA** | 7.23% | **0.0%** |
-
-> STA's guarantee of **zero mixed blocks** is the fundamental reason for its GPU efficiency advantage.
 
 #### Quality Preservation (Human Evaluation, Paper Data)
 
-```
-  STA-finetuned (2.43x speedup) vs Baseline HunyuanVideo:
+In human evaluation on MovieGen Bench (200 prompts), evaluators could not distinguish STA output from the original HunyuanVideo in **83%** of cases (STA Win 6.5%, Tie 83.0%, Original Win 10.5%).
 
-  Evaluators could not distinguish STA output from original in 83% of cases:
-
-  STA Win:   ██████                                6.5%
-  Tie:       ████████████████████████████████████  83.0%    ◄── near-indistinguishable
-  Orig Win:  ████████████                          10.5%
-```
-
-### 3.5 Measured Benchmark Data: B200 (Blackwell)
+### 3.5 Measured Benchmark Data: H100 (Hopper)
 
 #### Test Environment
 
 | Item | Detail |
 |:-----|:-------|
-| **GPU** | NVIDIA B200 (Blackwell, SM 10.0, 148 SMs) |
-| **Memory** | 178.35 GB HBM3e |
+| **GPU** | NVIDIA H100 80GB HBM3 (Hopper, SM 9.0, 132 SMs) |
+| **Memory** | 79.18 GB HBM3 |
 | **CUDA** | 12.9 |
 | **Precision** | BF16 |
-| **Backends** | STA Triton, FA4, SDPA |
+| **Backends** | STA CUDA (st_attn v0.0.7), FA3 (sgl-kernel), SDPA |
 
-> **Note**: The STA CUDA kernel (based on ThunderKittens/WGMMA) is **ISA-incompatible with Blackwell** — Hopper's WGMMA instructions were removed in SM 100 and replaced with TCGEN05. Only the Triton kernel works on B200.
+> **Note**: H100 is SM 9.0 with 132 SMs — the reference platform from the STA paper. The STA CUDA kernel full-window produces correct output (cos ~1.0). However, with the publicly released st_attn v0.0.7, **all sparse windows produce invalid micro-benchmark output** on this H100 setup. The STA paper reports results using an internal/newer kernel version. FA3 works as the paper's primary baseline.
 
-#### Latency & Speedup (B200)
+#### Micro-Benchmark: Latency & TFLOPS (H100)
 
-| Shape | Method | Window | Latency (ms) | Speedup | Sparsity |
-|:------|:-------|:-------|:------------:|:-------:|:--------:|
-| **HunyuanVideo** (30×48×80) | SDPA | full | 119.06 | 1.00x | — |
-| | FA4 | full | 122.74 | ~1.0x | — |
-| | STA Triton | (3,3,3) | **46.40** | **2.57x** | 91% |
-| | STA Triton | (3,6,1) | **35.05** | **3.40x** | 94% |
-| **StepVideo** (36×48×48) | SDPA | full | 61.63 | 1.00x | — |
-| | FA4 | full | 63.96 | ~1.0x | — |
-| | STA Triton | (3,3,3) | **24.01** | **2.57x** | 88% |
-| | STA Triton | (3,1,6) | **16.10** | **3.83x** | 92% |
-| **Wan 480P** (18×48×80) | SDPA | full | 42.45 | 1.00x | — |
-| | FA4 | full | 44.43 | ~1.0x | — |
-| | STA Triton | (3,3,3) | **16.61** | **2.56x** | 85% |
-| | STA Triton | (3,6,1) | **11.25** | **3.77x** | 90% |
+##### HunyuanVideo 5s 720P — `30x48x80` (115,456 tokens, Dense = 163.80 TFLOP)
 
-```
-  B200 Speedup: STA Triton Sparse vs SDPA Baseline
+| Method | Window | Latency (ms) | vs SDPA | vs FA3 | TFLOPS |
+|:-------|:-------|:------------:|:-------:|:------:|:------:|
+| **SDPA** (baseline) | full | 270.57 | 1.00x | 1.28x | **605** |
+| **FA3** (paper baseline) | full | 347.67 | 0.78x | 1.00x | **471** |
+| **STA CUDA full** | (5,6,10) | 326.05 | 0.83x | 1.07x | **502** |
+| **STA CUDA sparse** | (3,3,3) | 37.98* | 7.12x | 9.15x | — |
 
-  Speedup
-  4.0x ┤
-       │                                              ████
-  3.5x ┤              ████                            ████
-       │              ████              ████          ████
-  3.0x ┤              ████              ████          ████
-       │              ████              ████          ████
-  2.5x ┤  ████        ████  ████        ████  ████    ████
-       │  ████        ████  ████        ████  ████    ████
-  2.0x ┤  ████        ████  ████        ████  ████    ████
-       │  ████        ████  ████        ████  ████    ████
-  1.5x ┤  ████        ████  ████        ████  ████    ████
-       │  ████  ────  ████  ████  ────  ████  ████    ████
-  1.0x ┤──████──SDPA──████──████──SDPA──████──████────████──
-       │  ████        ████  ████        ████  ████    ████
-  0.5x ┤
-       │
-  0.0x ┴──────────────────────────────────────────────────────
-       HunyuanVideo (3,3,3)  StepVideo (3,3,3)   Wan (3,3,3)
-                     (3,6,1)            (3,1,6)        (3,6,1)
+##### StepVideo — `36x48x48` (82,944 tokens, Dense = 84.54 TFLOP)
 
-  ──── = SDPA baseline (1.0x)
-```
+| Method | Window | Latency (ms) | vs SDPA | vs FA3 | TFLOPS |
+|:-------|:-------|:------------:|:-------:|:------:|:------:|
+| **SDPA** (baseline) | full | 141.25 | 1.00x | 1.29x | **598** |
+| **FA3** (paper baseline) | full | 182.47 | 0.77x | 1.00x | **463** |
+| **STA CUDA full** | (6,6,6) | 162.06 | 0.87x | 1.13x | **522** |
 
-### 3.6 Measured Benchmark Data: H20 (Hopper)
+##### Wan 5s 480P — `18x48x80` (69,120 tokens, Dense = 58.71 TFLOP)
 
-#### Test Environment
+| Method | Window | Latency (ms) | vs SDPA | vs FA3 | TFLOPS |
+|:-------|:-------|:------------:|:-------:|:------:|:------:|
+| **SDPA** (baseline) | full | 98.14 | 1.00x | 1.29x | **598** |
+| **FA3** (paper baseline) | full | 126.89 | 0.77x | 1.00x | **463** |
+| **STA CUDA full** | (3,6,10) | 107.41 | 0.91x | 1.18x | **547** |
 
-| Item | Detail |
-|:-----|:-------|
-| **GPU** | NVIDIA H20 (Hopper, SM 9.0, 78 SMs) |
-| **Memory** | 95.08 GB HBM3 |
-| **CUDA** | 12.9 |
-| **Precision** | BF16 |
-| **Backends** | STA CUDA, STA Triton, FA3, SDPA |
+> *Sparse window latency is measured but output is **invalid** (cos=0.30) with st_attn v0.0.7. The STA paper's internal kernel reports 25.38ms / 10.45x vs FA3 at 91% sparsity on H100.
 
-> **Key**: H20 is SM 9.0 (same as H100), so the native STA CUDA kernel works. This enables direct comparison between the optimized CUDA kernel and the cross-platform Triton kernel.
+#### End-to-End: FastHunyuan on H100
 
-#### Latency & Speedup (H20)
+Despite micro-benchmark correctness concerns, the end-to-end FastHunyuan pipeline with STA sparse produces successful video output:
 
-| Shape | Method | Window | Latency (ms) | Speedup | Sparsity |
-|:------|:-------|:-------|:------------:|:-------:|:--------:|
-| **HunyuanVideo** (30×48×80) | SDPA | full | 1,156.9 | 1.00x | — |
-| | FA3 | full | 1,163.4 | 0.99x | — |
-| | STA CUDA | (3,3,3) | **131.3** | **8.81x** | 91% |
-| | STA Triton | (3,3,3) | 130.3 | 8.88x | 91% |
-| | STA Triton | (3,6,1) | **93.6** | **12.36x** | 94% |
-| **StepVideo** (36×48×48) | SDPA | full | 595.3 | 1.00x | — |
-| | FA3 | full | 603.5 | 0.99x | — |
-| | STA CUDA | (3,3,3) | **82.2** | **7.24x** | 88% |
-| | STA Triton | (3,3,3) | 90.1 | 6.61x | 88% |
-| | STA Triton | (3,6,1) | **60.1** | **9.90x** | 92% |
-| **Wan 480P** (18×48×80) | SDPA | full | 413.9 | 1.00x | — |
-| | FA3 | full | 419.9 | 0.99x | — |
-| | STA CUDA | (3,3,3) | 67.9 | 6.10x | 85% |
-| | STA CUDA | (3,6,1) | **45.1** | **9.18x** | 90% |
-| | STA Triton | (3,6,1) | **47.6** | **8.70x** | 90% |
+| Metric | FA3 Baseline | SDPA Baseline | STA CUDA Sparse | vs FA3 | vs SDPA |
+|:-------|:------------:|:-------------:|:---------------:|:------:|:-------:|
+| **Denoising time** | 77.68s | 77.42s | **46.28s** | **1.68x** | **1.67x** |
+| Avg step time | 12.95s/step | 12.90s/step | 7.71s/step | 1.68x | 1.67x |
+| End-to-end | 104.17s | 104.23s | **67.10s** | **1.55x** | **1.55x** |
 
-```
-  H20 Speedup: STA CUDA vs STA Triton vs SDPA Baseline
+> **Setup**: 2× H100 80GB, FastHunyuan-diffusers (12.82B params), Ulysses SP degree=2, 6 inference steps. STA config: steps 0-1 full window [5,6,10], steps 2-5 sparse [3,3,3] (91% sparsity).
 
-  Speedup
-  13x ┤
-  12x ┤  ▓▓▓▓
-  11x ┤  ▓▓▓▓
-  10x ┤  ▓▓▓▓              ▓▓▓▓
-   9x ┤  ▓▓▓▓  ████        ▓▓▓▓              ████
-   8x ┤  ▓▓▓▓  ████        ▓▓▓▓        ████  ████
-   7x ┤  ▓▓▓▓  ████        ▓▓▓▓  ████  ████  ████
-   6x ┤  ▓▓▓▓  ████        ▓▓▓▓  ████  ████  ████  ████
-   5x ┤  ▓▓▓▓  ████        ▓▓▓▓  ████  ████  ████  ████
-   4x ┤  ▓▓▓▓  ████        ▓▓▓▓  ████  ████  ████  ████
-   3x ┤  ▓▓▓▓  ████        ▓▓▓▓  ████  ████  ████  ████
-   2x ┤  ▓▓▓▓  ████        ▓▓▓▓  ████  ████  ████  ████
-   1x ┤──▓▓▓▓──████──SDPA──▓▓▓▓──████──SDPA──████──████──SDPA──
-   0x ┴──────────────────────────────────────────────────────────
-      HunyuanVideo           StepVideo             Wan 480P
-      Triton CUDA            Triton CUDA         CUDA  Triton
-      (3,6,1)(3,3,3)         (3,6,1)(3,3,3)      (3,6,1)(3,6,1)
+#### H100 Key Findings
 
-  ████ = STA CUDA    ▓▓▓▓ = STA Triton    ── = SDPA baseline
-```
+1. **FA3 achieves ~463–471 TFLOPS on H100 (0.77x SDPA)** — notably slower than SDPA, likely due to varlen interface overhead. The STA paper uses FA3 as the baseline, so STA speedups should be compared against FA3.
 
-### 3.7 STA Correctness Verification
+2. **End-to-end STA sparse delivers 1.68x denoising speedup** — the FastHunyuan pipeline with STA sparse (steps 0-1 full, steps 2-5 sparse at 91% sparsity) achieves 46.28s vs 77.68s FA3 baseline.
 
-STA with **full window** (equivalent to full attention, just reordered) produces numerically identical results:
-
-| Platform | Shape | L2 Relative Error | Cosine Similarity | Status |
-|:---------|:------|:-----------------:|:-----------------:|:------:|
-| B200 | HunyuanVideo (30×48×80) | 0.003123 | 0.999995 | PASS |
-| B200 | StepVideo (36×48×48) | 0.003183 | 0.999995 | PASS |
-| B200 | Wan 480P (18×48×80) | 0.003084 | 0.999995 | PASS |
-| H20 (CUDA) | HunyuanVideo (30×48×80) | 0.000251 | 1.000000 | PASS |
-| H20 (CUDA) | StepVideo (36×48×48) | 0.000218 | 1.000000 | PASS |
-| H20 (CUDA) | Wan 480P (18×48×80) | 0.000200 | 1.000000 | PASS |
-
-> The tiny error (L2 < 0.004) is from BF16 floating-point rounding in different computation ordering. The CUDA kernel achieves ~10x tighter error than Triton due to optimized memory access patterns.
-
-### 3.8 Cross-Platform Comparison Summary
-
-```
-                        SDPA Baseline            STA Sparse (3,3,3)
-  Platform          Latency    TFLOPS         Speedup    Kernel
-  ─────────────────────────────────────────────────────────────────
-  B200 (Blackwell)   119 ms     1,376          2.57x     Triton
-  H20  (Hopper)    1,157 ms       142          8.81x     CUDA
-  MI300X (AMD)     2,414 ms        68         10.07x     Triton
-  ─────────────────────────────────────────────────────────────────
-
-  Key insight: STA speedup ratios are HIGHER on platforms where SDPA is slower.
-  The CUDA kernel on H20 achieves the best balance of efficiency + speedup.
-
-  H100 data: TBD (testing in progress, will be updated)
-```
-
-### 3.9 Hardware Implications for Custom Operator Development
-
-From the STA analysis, key takeaways for hardware operator design:
-
-1. **Tile-aligned computation is critical** — the core reason STA outperforms NATTEN/CLEAR is that tile boundaries align with FlashAttention block boundaries, producing zero mixed blocks. Custom operators should support configurable tile/block sizes.
-
-2. **The matmul itself is unchanged** — STA does not modify the Q@K^T or P@V computation. The speedup comes purely from the scheduler (which tiles to compute). This means the same matmul kernel can serve both full and sparse attention.
-
-3. **Cross-platform Triton vs native CUDA** — On H20, the native CUDA kernel is only 5-15% faster than Triton for STA. The bigger gap is in full-attention mode (CUDA 0.93x SDPA vs Triton 0.83x SDPA). For sparse attention, the tile-skip scheduling matters more than low-level kernel optimization.
-
-4. **ISA portability matters** — The STA CUDA kernel uses Hopper WGMMA instructions that were **removed** in Blackwell (replaced by TCGEN05). A production operator must abstract the MMA instruction layer to support multiple GPU architectures.
+3. **STA paper reports 10.45x kernel-level speedup on H100** — the publicly released st_attn v0.0.7 does not reproduce sparse micro-benchmark results, suggesting the paper used an internal kernel version.
 
 ---
 

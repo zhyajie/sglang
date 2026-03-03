@@ -1,0 +1,152 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 580" font-family="Segoe UI, Arial, sans-serif">
+  <defs>
+    <filter id="sh" x="-1%" y="-1%" width="102%" height="102%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#94a3b8"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="580" fill="#ffffff" rx="12"/>
+
+  <!-- Title -->
+  <text x="480" y="36" text-anchor="middle" font-size="20" font-weight="bold" fill="#1e293b">Attention Acceleration Taxonomy</text>
+  <text x="480" y="56" text-anchor="middle" font-size="13" fill="#94a3b8">Four strategies to reduce the attention bottleneck in Diffusion Transformers</text>
+
+  <!-- Full Attention (center top) -->
+  <rect x="330" y="75" width="300" height="60" fill="#fef2f2" stroke="#ef4444" stroke-width="2" rx="10" filter="url(#sh)"/>
+  <text x="480" y="102" text-anchor="middle" font-size="16" font-weight="bold" fill="#dc2626">Full Attention (Baseline)</text>
+  <text x="480" y="122" text-anchor="middle" font-size="12" fill="#991b1b">O(N&#xB2;) complexity  |  60-85% of inference time</text>
+
+  <!-- Arrows from center to 4 boxes -->
+  <line x1="380" y1="135" x2="180" y2="175" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="430" y1="135" x2="380" y2="175" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="530" y1="135" x2="580" y2="175" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="580" y1="135" x2="780" y2="175" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Strategy 1: Quantization -->
+  <rect x="30" y="180" width="220" height="200" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5" rx="10" filter="url(#sh)"/>
+  <rect x="30" y="180" width="220" height="36" fill="#3b82f6" rx="10"/>
+  <rect x="30" y="200" width="220" height="16" fill="#3b82f6"/>
+  <text x="140" y="204" text-anchor="middle" font-size="14" font-weight="bold" fill="#fff">Quantization</text>
+
+  <!-- Quantization icon: grid with numbers -->
+  <g transform="translate(50, 230)">
+    <rect x="0" y="0" width="28" height="28" fill="#dbeafe" stroke="#93c5fd" rx="4"/>
+    <text x="14" y="15" text-anchor="middle" font-size="8" font-weight="bold" fill="#2563eb">FP16</text>
+    <text x="14" y="25" text-anchor="middle" font-size="7" fill="#60a5fa">Q, K</text>
+    <text x="35" y="16" text-anchor="middle" font-size="16" fill="#94a3b8">&#x2192;</text>
+    <rect x="44" y="0" width="28" height="28" fill="#bfdbfe" stroke="#3b82f6" rx="4"/>
+    <text x="58" y="15" text-anchor="middle" font-size="8" font-weight="bold" fill="#1d4ed8">INT8</text>
+    <text x="58" y="25" text-anchor="middle" font-size="7" fill="#2563eb">Q, K</text>
+  </g>
+
+  <text x="140" y="278" text-anchor="middle" font-size="11" fill="#334155">Same N&#xB2; ops, cheaper each</text>
+  <text x="140" y="296" text-anchor="middle" font-size="11" fill="#334155">INT8 tensor cores = 2x</text>
+  <text x="140" y="314" text-anchor="middle" font-size="11" fill="#334155">throughput vs FP16</text>
+
+  <line x1="45" y1="328" x2="235" y2="328" stroke="#bfdbfe" stroke-width="1"/>
+  <text x="140" y="346" text-anchor="middle" font-size="12" font-weight="bold" fill="#1e40af">SageAttention</text>
+  <text x="140" y="363" text-anchor="middle" font-size="11" fill="#3b82f6">SageAttn v2/v3</text>
+
+  <!-- Strategy 2: Spatial Sparsity -->
+  <rect x="270" y="180" width="220" height="200" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5" rx="10" filter="url(#sh)"/>
+  <rect x="270" y="180" width="220" height="36" fill="#16a34a" rx="10"/>
+  <rect x="270" y="200" width="220" height="16" fill="#16a34a"/>
+  <text x="380" y="204" text-anchor="middle" font-size="14" font-weight="bold" fill="#fff">Spatial Sparsity</text>
+
+  <!-- Sparsity icon: grid with some cells empty -->
+  <g transform="translate(300, 228)">
+    <rect x="0" y="0" width="14" height="14" fill="#bbf7d0" stroke="#86efac" rx="2"/>
+    <rect x="16" y="0" width="14" height="14" fill="#bbf7d0" stroke="#86efac" rx="2"/>
+    <rect x="32" y="0" width="14" height="14" fill="#f1f5f9" stroke="#e2e8f0" rx="2"/>
+    <rect x="48" y="0" width="14" height="14" fill="#f1f5f9" stroke="#e2e8f0" rx="2"/>
+    <rect x="0" y="16" width="14" height="14" fill="#bbf7d0" stroke="#86efac" rx="2"/>
+    <rect x="16" y="16" width="14" height="14" fill="#4ade80" stroke="#22c55e" rx="2"/>
+    <text x="23" y="28" text-anchor="middle" font-size="8" font-weight="bold" fill="#fff">Q</text>
+    <rect x="32" y="16" width="14" height="14" fill="#bbf7d0" stroke="#86efac" rx="2"/>
+    <rect x="48" y="16" width="14" height="14" fill="#f1f5f9" stroke="#e2e8f0" rx="2"/>
+    <rect x="0" y="32" width="14" height="14" fill="#f1f5f9" stroke="#e2e8f0" rx="2"/>
+    <rect x="16" y="32" width="14" height="14" fill="#bbf7d0" stroke="#86efac" rx="2"/>
+    <rect x="32" y="32" width="14" height="14" fill="#bbf7d0" stroke="#86efac" rx="2"/>
+    <rect x="48" y="32" width="14" height="14" fill="#f1f5f9" stroke="#e2e8f0" rx="2"/>
+    <text x="82" y="22" font-size="10" fill="#6b7280">Skip 85-94%</text>
+    <text x="82" y="36" font-size="10" fill="#6b7280">of tiles</text>
+  </g>
+
+  <text x="380" y="296" text-anchor="middle" font-size="11" fill="#334155">Skip most Q-K pairs</text>
+  <text x="380" y="314" text-anchor="middle" font-size="11" fill="#334155">based on 3D locality</text>
+
+  <line x1="285" y1="328" x2="475" y2="328" stroke="#bbf7d0" stroke-width="1"/>
+  <text x="380" y="346" text-anchor="middle" font-size="12" font-weight="bold" fill="#166534">STA, VSA, VMoBA</text>
+  <text x="380" y="363" text-anchor="middle" font-size="11" fill="#16a34a">90% sparsity &#x2248; 10x fewer ops</text>
+
+  <!-- Strategy 3: Linear Attention -->
+  <rect x="510" y="180" width="220" height="200" fill="#fefce8" stroke="#eab308" stroke-width="1.5" rx="10" filter="url(#sh)"/>
+  <rect x="510" y="180" width="220" height="36" fill="#ca8a04" rx="10"/>
+  <rect x="510" y="200" width="220" height="16" fill="#ca8a04"/>
+  <text x="620" y="204" text-anchor="middle" font-size="14" font-weight="bold" fill="#fff">Linear Attention</text>
+
+  <!-- Linear icon: O(N) curve -->
+  <g transform="translate(540, 228)">
+    <line x1="0" y1="45" x2="70" y2="45" stroke="#d4d4d8" stroke-width="0.8"/>
+    <line x1="0" y1="0" x2="0" y2="45" stroke="#d4d4d8" stroke-width="0.8"/>
+    <path d="M 0 40 Q 35 30, 70 5" fill="none" stroke="#fca5a5" stroke-width="1.5" stroke-dasharray="3,2"/>
+    <path d="M 0 42 L 70 25" fill="none" stroke="#eab308" stroke-width="2"/>
+    <text x="72" y="10" font-size="8" fill="#fca5a5">O(N&#xB2;)</text>
+    <text x="72" y="28" font-size="8" fill="#ca8a04" font-weight="bold">O(N)</text>
+  </g>
+
+  <text x="620" y="296" text-anchor="middle" font-size="11" fill="#334155">Replace softmax with</text>
+  <text x="620" y="314" text-anchor="middle" font-size="11" fill="#334155">linear kernel: O(N&#xB2;) &#x2192; O(N)</text>
+
+  <line x1="525" y1="328" x2="715" y2="328" stroke="#fef9c3" stroke-width="1"/>
+  <text x="620" y="346" text-anchor="middle" font-size="12" font-weight="bold" fill="#854d0e">SLA</text>
+  <text x="620" y="363" text-anchor="middle" font-size="11" fill="#ca8a04">Requires model fine-tuning</text>
+
+  <!-- Strategy 4: Hybrid -->
+  <rect x="750" y="180" width="180" height="200" fill="#faf5ff" stroke="#a855f7" stroke-width="1.5" rx="10" filter="url(#sh)"/>
+  <rect x="750" y="180" width="180" height="36" fill="#9333ea" rx="10"/>
+  <rect x="750" y="200" width="180" height="16" fill="#9333ea"/>
+  <text x="840" y="204" text-anchor="middle" font-size="14" font-weight="bold" fill="#fff">Hybrid</text>
+
+  <!-- Hybrid icon: overlapping circles -->
+  <g transform="translate(800, 245)">
+    <circle cx="0" cy="0" r="18" fill="#dbeafe" fill-opacity="0.7" stroke="#3b82f6" stroke-width="1"/>
+    <circle cx="22" cy="0" r="18" fill="#dcfce7" fill-opacity="0.7" stroke="#22c55e" stroke-width="1"/>
+    <text x="11" y="4" text-anchor="middle" font-size="7" font-weight="bold" fill="#6b21a8">+</text>
+  </g>
+
+  <text x="840" y="290" text-anchor="middle" font-size="11" fill="#334155">Combine quant</text>
+  <text x="840" y="308" text-anchor="middle" font-size="11" fill="#334155">+ sparsity for</text>
+  <text x="840" y="326" text-anchor="middle" font-size="11" fill="#334155">multiplicative gains</text>
+
+  <line x1="765" y1="340" x2="915" y2="340" stroke="#e9d5ff" stroke-width="1"/>
+  <text x="840" y="358" text-anchor="middle" font-size="12" font-weight="bold" fill="#7e22ce">SageSLA</text>
+  <text x="840" y="375" text-anchor="middle" font-size="11" fill="#9333ea">SpargeAttention</text>
+
+  <!-- Bottom summary -->
+  <rect x="30" y="405" width="900" height="60" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1" rx="8"/>
+  <text x="480" y="430" text-anchor="middle" font-size="13" fill="#475569" font-weight="bold">Key Insight: No single strategy works for all models</text>
+  <text x="480" y="450" text-anchor="middle" font-size="12" fill="#64748b">Different model architectures, training methods, and hardware constraints favor different approaches.</text>
+
+  <!-- Speedup comparison bar -->
+  <rect x="30" y="480" width="900" height="86" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1" rx="8"/>
+  <text x="480" y="502" text-anchor="middle" font-size="13" font-weight="bold" fill="#334155">Typical Speedup Range (vs Full Attention)</text>
+  <g transform="translate(60, 515)">
+    <rect x="0" y="0" width="160" height="20" fill="#3b82f6" rx="4"/>
+    <text x="80" y="14" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">Quant: ~2x</text>
+    <rect x="180" y="0" width="320" height="20" fill="#22c55e" rx="4"/>
+    <text x="340" y="14" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">Sparsity: 2x - 10x</text>
+    <rect x="520" y="0" width="160" height="20" fill="#eab308" rx="4"/>
+    <text x="600" y="14" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">Linear: 5x - 20x</text>
+    <rect x="700" y="0" width="160" height="20" fill="#a855f7" rx="4"/>
+    <text x="780" y="14" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">Hybrid: 4x - 20x+</text>
+
+    <text x="0" y="42" font-size="10" fill="#94a3b8">1x</text>
+    <text x="860" y="42" font-size="10" fill="#94a3b8">20x+</text>
+    <line x1="0" y1="28" x2="860" y2="28" stroke="#e2e8f0" stroke-width="1"/>
+  </g>
+</svg>
