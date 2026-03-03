@@ -1222,12 +1222,19 @@ class DenoisingStage(PipelineStage):
             self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
+            vsa_sparsity = None
+            try:
+                vsa_sparsity = server_args.attention_backend_config.get(
+                    "VSA_sparsity", None
+                )
+            except (AttributeError, TypeError):
+                pass
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+                VSA_sparsity=vsa_sparsity,
                 device=get_local_torch_device(),
             )
         elif (
@@ -1517,9 +1524,16 @@ class DenoisingStage(PipelineStage):
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
         try:
-            STA_mode = STA_Mode[server_args.attention_backend_config.STA_mode]
+            sta_mode_str = server_args.attention_backend_config.get(
+                "STA_mode", "STA_INFERENCE"
+            )
+            if not sta_mode_str or not isinstance(sta_mode_str, str):
+                sta_mode_str = "STA_INFERENCE"
+            STA_mode = STA_Mode[sta_mode_str]
         except Exception as e:
-            logger.error(f"Passed STA_mode: {STA_mode} doesn't exist")
+            logger.error(
+                f"Passed STA_mode: {server_args.attention_backend_config.get('STA_mode', 'UNSET')} doesn't exist"
+            )
             raise e
         skip_time_steps = server_args.attention_backend_config.skip_time_steps
         if batch.timesteps is None:
