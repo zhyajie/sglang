@@ -760,6 +760,9 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
+        # Use 5D block layout on ROCm with page_size > 1
+        self.use_block_layout = _is_hip and self.page_size > 1
+
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -832,24 +835,48 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                if self.use_block_layout:
+                    # 5D block layout for ROCm pa_decode_gluon / mha_batch_prefill_func
+                    # x = vector width in elements (16 bytes / element_size)
+                    x = 16 // self.store_dtype.itemsize
+                    num_pages = (self.size + self.page_size) // self.page_size
+                    # K: [num_pages, num_kv_heads, head_dim // x, page_size, x]
+                    self.k_buffer = [
+                        torch.zeros(
+                            (num_pages, self.head_num, self.head_dim // x, self.page_size, x),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    # V: [num_pages, num_kv_heads, page_size // x, v_head_dim, x]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (num_pages, self.head_num, self.page_size // x, self.v_head_dim, x),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                else:
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.v_head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -949,6 +976,9 @@ class MHATokenToKVPool(KVCache):
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
+        if self.use_block_layout:
+            # 5D block layout: return as-is, dtype reinterpretation not needed
+            return self.k_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
@@ -963,6 +993,9 @@ class MHATokenToKVPool(KVCache):
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
+        if self.use_block_layout:
+            # 5D block layout: return as-is, dtype reinterpretation not needed
+            return self.v_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
@@ -971,6 +1004,9 @@ class MHATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_value_buffer(layer_id)
+
+    def get_v_head_dim(self):
+        return self.v_head_dim
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -989,6 +1025,40 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+
+        if self.use_block_layout:
+            from aiter.ops.cache import reshape_and_cache
+
+            k_cache = self.k_buffer[layer_id - self.start_layer]
+            v_cache = self.v_buffer[layer_id - self.start_layer]
+            # cache_k/cache_v shape: [num_tokens, num_heads, head_dim]
+            # loc is the flat slot_mapping (token-level indices)
+            is_fp8 = self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn)
+            kv_cache_dtype = "fp8" if is_fp8 else "auto"
+            # Convert scalar scales to tensors for reshape_and_cache
+            k_scale_t = (
+                torch.tensor([k_scale], dtype=torch.float32, device=self.device)
+                if isinstance(k_scale, (int, float))
+                else k_scale
+            )
+            v_scale_t = (
+                torch.tensor([v_scale], dtype=torch.float32, device=self.device)
+                if isinstance(v_scale, (int, float))
+                else v_scale
+            )
+            reshape_and_cache(
+                cache_k.contiguous(),
+                cache_v.contiguous(),
+                k_cache,
+                v_cache,
+                loc.to(torch.int64),
+                kv_cache_dtype=kv_cache_dtype,
+                k_scale=k_scale_t,
+                v_scale=v_scale_t,
+                asm_layout=True,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
