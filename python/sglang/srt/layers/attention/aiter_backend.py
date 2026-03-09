@@ -2081,15 +2081,20 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=(window_size[0], window_size[1], 0),
                 )
             else:
-                # For flat layout, FP8 requires cast to BF16
-                # Block layout (page_size >= 128) handles FP8 natively
-                if not self.use_block_layout and self.kv_cache_dtype == fp8_dtype:
-                    dtype = q.dtype
-                    k_cache = k_cache.to(dtype)
-                    v_cache = v_cache.to(dtype)
+                is_fp8 = self.kv_cache_dtype == fp8_dtype
+                q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+                # For FP8 KV cache: cast Q to FP8, pass descale=1.0
+                # For flat FP8 (non-block): cast KV to BF16
+                if is_fp8 and self.use_block_layout:
+                    q_3d = q_3d.to(fp8_dtype)
+                    descale = torch.ones(1, dtype=torch.float32, device=q_3d.device)
+                elif is_fp8:
+                    k_cache = k_cache.to(q.dtype)
+                    v_cache = v_cache.to(q.dtype)
 
                 o = mha_batch_prefill_func(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q_3d,
                     k_cache,
                     v_cache,
                     self.qo_indptr[:bs0],
@@ -2104,6 +2109,9 @@ class AiterAttnBackend(AttentionBackend):
                     return_attn_probs=False,
                     window_size=window_size,
                     kv_last_page_lens=self.forward_metadata.kv_last_page_len,
+                    q_descale=descale if is_fp8 and self.use_block_layout else None,
+                    k_descale=descale if is_fp8 and self.use_block_layout else None,
+                    v_descale=descale if is_fp8 and self.use_block_layout else None,
                 )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
