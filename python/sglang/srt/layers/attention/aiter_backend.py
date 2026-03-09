@@ -2180,22 +2180,20 @@ class AiterAttnBackend(AttentionBackend):
                 # Use pa_decode_gluon with 5D block layout
                 num_seqs = q.shape[0]
                 query_group_size = layer.tp_q_head_num // layer.tp_k_head_num
+                context_partition_size = 256
 
-                # Lazily allocate and cache intermediate buffers
-                if not hasattr(self, '_gluon_decode_cache') or self._gluon_decode_cache is None:
-                    self._gluon_decode_cache = {}
-                cache = self._gluon_decode_cache
-                cache_key = (num_seqs, layer.tp_k_head_num, query_group_size, layer.qk_head_dim, q.dtype)
-                if cache_key not in cache:
-                    max_ctx_part = get_recommended_splits(num_seqs, layer.tp_k_head_num)
-                    shape = (num_seqs, layer.tp_k_head_num, max_ctx_part, query_group_size)
-                    cache[cache_key] = (
-                        max_ctx_part,
-                        torch.empty(shape, dtype=torch.float32, device=self.device),
-                        torch.empty(shape, dtype=torch.float32, device=self.device),
-                        torch.empty(*shape, layer.qk_head_dim, dtype=q.dtype, device=self.device),
-                    )
-                max_context_partition_num, exp_sums, max_logits, temporary_output = cache[cache_key]
+                # max_context_partition_num must cover the longest sequence
+                max_context_len = self.forward_metadata.context_lengths.max().item()
+                needed_parts = triton.cdiv(max_context_len, context_partition_size)
+                recommended_parts = get_recommended_splits(num_seqs, layer.tp_k_head_num)
+                max_context_partition_num = max(needed_parts, recommended_parts)
+
+                shape = (num_seqs, layer.tp_k_head_num, max_context_partition_num, query_group_size)
+                exp_sums = torch.empty(shape, dtype=torch.float32, device=self.device)
+                max_logits = torch.empty(shape, dtype=torch.float32, device=self.device)
+                temporary_output = torch.empty(
+                    *shape, layer.qk_head_dim, dtype=q.dtype, device=self.device
+                )
 
                 is_fp8 = self.kv_cache_dtype == fp8_dtype
                 compute_type = aiter_dtypes.fp8 if is_fp8 else torch.bfloat16
