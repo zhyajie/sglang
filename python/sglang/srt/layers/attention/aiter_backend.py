@@ -2044,13 +2044,15 @@ class AiterAttnBackend(AttentionBackend):
                 total_tokens = token_kv_indices.shape[0]
 
                 q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                cache_dtype = k_cache.dtype
+                x = 16 // cache_dtype.itemsize  # vector size based on cache dtype
+
                 k_flat = torch.empty(
                     total_tokens, layer.tp_k_head_num, layer.head_dim,
-                    dtype=q_3d.dtype, device=q_3d.device,
+                    dtype=cache_dtype, device=q_3d.device,
                 )
                 v_flat = torch.empty_like(k_flat)
 
-                x = 16 // q_3d.dtype.itemsize  # vector size: 8 for bf16, 16 for fp8
                 _gather_5d_kv_kernel[(total_tokens, layer.tp_k_head_num)](
                     k_cache, v_cache, token_kv_indices,
                     k_flat, v_flat,
@@ -2059,6 +2061,11 @@ class AiterAttnBackend(AttentionBackend):
                     head_dim=layer.head_dim,
                     x=x,
                 )
+
+                # Cast FP8 to compute dtype for flash attention
+                if cache_dtype != q_3d.dtype:
+                    k_flat = k_flat.to(q_3d.dtype)
+                    v_flat = v_flat.to(q_3d.dtype)
 
                 o = flash_attn_varlen_func(
                     q_3d,

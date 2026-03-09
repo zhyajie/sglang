@@ -642,9 +642,11 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
-            self.store_dtype = torch.uint8
+        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for fp8 types
+            # For block layout (page_size > 1), keep fp8 dtype since reshape_and_cache(asm_layout=True)
+            # handles it natively without index_put
+            self.store_dtype = dtype if page_size > 1 else torch.uint8
         else:
             self.store_dtype = dtype
         self.layer_num = layer_num
@@ -1033,7 +1035,7 @@ class MHATokenToKVPool(KVCache):
             v_cache = self.v_buffer[layer_id - self.start_layer]
             # cache_k/cache_v shape: [num_tokens, num_heads, head_dim]
             # loc is the flat slot_mapping (token-level indices)
-            is_fp8 = self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn)
+            is_fp8 = self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             kv_cache_dtype = "fp8" if is_fp8 else "auto"
             # Convert scalar scales to tensors for reshape_and_cache
             k_scale_t = (
