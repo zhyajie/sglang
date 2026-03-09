@@ -2037,8 +2037,9 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
-            if self.use_block_layout:
-                # Gather flat KV from 5D paged cache, then use flash_attn_varlen_func
+            if self.use_block_layout and self.page_size < 128:
+                # Small page sizes not supported by mha_batch_prefill_func CK kernel
+                # Use gather + flash_attn_varlen_func instead
                 token_kv_indices = self.forward_metadata.token_kv_indices
                 token_kv_indptr = self.forward_metadata.token_kv_indptr
                 total_tokens = token_kv_indices.shape[0]
@@ -2080,8 +2081,9 @@ class AiterAttnBackend(AttentionBackend):
                     window_size=(window_size[0], window_size[1], 0),
                 )
             else:
-                # Legacy flat layout: FP8 requires cast to BF16
-                if self.kv_cache_dtype == fp8_dtype:
+                # For flat layout, FP8 requires cast to BF16
+                # Block layout (page_size >= 128) handles FP8 natively
+                if not self.use_block_layout and self.kv_cache_dtype == fp8_dtype:
                     dtype = q.dtype
                     k_cache = k_cache.to(dtype)
                     v_cache = v_cache.to(dtype)
