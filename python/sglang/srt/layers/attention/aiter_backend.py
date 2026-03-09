@@ -99,6 +99,7 @@ class ForwardMetadata:
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     block_tables: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
+    max_context_len: Optional[int] = None
     token_kv_indptr: Optional[torch.Tensor] = None
     token_kv_indices: Optional[torch.Tensor] = None
 
@@ -340,6 +341,27 @@ class AiterAttnBackend(AttentionBackend):
             self.block_tables_buf = torch.zeros(
                 (max_bs, max_num_blocks),
                 dtype=torch.int32,
+                device=self.device,
+            )
+            # Pre-allocate context_lengths buffer for CUDA graph address stability
+            self.context_lengths_buf = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+            # Pre-allocate workspace buffers for pa_decode_gluon (needed for CUDA graph)
+            query_group_size = self.num_head // self.num_kv_head
+            self.gluon_exp_sums = torch.empty(
+                (max_bs, self.num_kv_head, self.max_num_partitions, query_group_size),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.gluon_max_logits = torch.empty(
+                (max_bs, self.num_kv_head, self.max_num_partitions, query_group_size),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.gluon_temporary_output = torch.empty(
+                (max_bs, self.num_kv_head, self.max_num_partitions, query_group_size, self.head_dim),
+                dtype=torch.bfloat16,
                 device=self.device,
             )
 
@@ -627,7 +649,7 @@ class AiterAttnBackend(AttentionBackend):
                 max_num_blocks = (max_seq_len + self.page_size - 1) // self.page_size
                 # Use next power of 2 for triton constexpr
                 max_num_blocks_triton = triton.next_power_of_2(max_num_blocks)
-                block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                block_tables = self.block_tables_buf[:bs]
                 _build_block_tables_kernel[(bs,)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
@@ -690,6 +712,7 @@ class AiterAttnBackend(AttentionBackend):
                 run_graph=False,
                 block_tables=block_tables,
                 context_lengths=context_lengths,
+                max_context_len=max_seq_len if context_lengths is not None else None,
             )
 
         elif forward_batch.forward_mode.is_draft_extend():
@@ -1132,11 +1155,13 @@ class AiterAttnBackend(AttentionBackend):
 
             # Build block_tables and context_lengths for pa_decode_gluon (non-MLA)
             if self.use_block_layout and spec_info is None:
-                context_lengths = seq_lens.to(torch.int32)
+                self.context_lengths_buf[:bs].copy_(seq_lens)
+                context_lengths = self.context_lengths_buf[:bs]
                 max_seq_len = seq_lens.max().item()
                 max_num_blocks = (max_seq_len + self.page_size - 1) // self.page_size
                 max_num_blocks_triton = triton.next_power_of_2(max_num_blocks)
-                block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                # Use full block_tables buffer width for CUDA graph address stability
+                block_tables = self.block_tables_buf[:bs]
                 _build_block_tables_kernel[(bs,)](
                     self.req_to_token,
                     req_pool_indices,
@@ -1199,6 +1224,7 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 block_tables=block_tables,
                 context_lengths=context_lengths,
+                max_context_len=max_seq_len if context_lengths is not None else None,
             )
 
         elif forward_mode.is_target_verify():
@@ -1427,11 +1453,13 @@ class AiterAttnBackend(AttentionBackend):
 
             # Build block_tables and context_lengths for pa_decode_gluon (non-MLA)
             if self.use_block_layout and spec_info is None:
-                context_lengths = seq_lens.to(torch.int32)
+                self.context_lengths_buf[:bs].copy_(seq_lens)
+                context_lengths = self.context_lengths_buf[:bs]
                 max_seq_len = seq_lens.max().item()
                 max_num_blocks = (max_seq_len + self.page_size - 1) // self.page_size
                 max_num_blocks_triton = triton.next_power_of_2(max_num_blocks)
-                block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                # Use full block_tables buffer width for CUDA graph address stability
+                block_tables = self.block_tables_buf[:bs]
                 _build_block_tables_kernel[(bs,)](
                     self.req_to_token,
                     req_pool_indices,
@@ -1494,6 +1522,19 @@ class AiterAttnBackend(AttentionBackend):
                     num_kv_splits=num_kv_splits,
                     block_tables=block_tables,
                     context_lengths=context_lengths,
+                    max_context_len=max_seq_len if context_lengths is not None else None,
+                )
+            else:
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    None,
+                    block_tables=block_tables,
+                    context_lengths=context_lengths,
+                    max_context_len=max_seq_len if context_lengths is not None else None,
                 )
 
         elif forward_mode.is_target_verify():
@@ -2187,21 +2228,15 @@ class AiterAttnBackend(AttentionBackend):
             if self.use_block_layout:
                 # Use pa_decode_gluon with 5D block layout
                 num_seqs = q.shape[0]
-                query_group_size = layer.tp_q_head_num // layer.tp_k_head_num
-                context_partition_size = 256
 
-                # max_context_partition_num must cover the longest sequence
-                max_context_len = self.forward_metadata.context_lengths.max().item()
-                needed_parts = triton.cdiv(max_context_len, context_partition_size)
-                recommended_parts = get_recommended_splits(num_seqs, layer.tp_k_head_num)
-                max_context_partition_num = max(needed_parts, recommended_parts)
+                # Use the model's max partitions to ensure CUDA graph compatibility
+                # (fixed grid dimensions and buffer shapes across replays)
+                max_context_partition_num = self.max_num_partitions
 
-                shape = (num_seqs, layer.tp_k_head_num, max_context_partition_num, query_group_size)
-                exp_sums = torch.empty(shape, dtype=torch.float32, device=self.device)
-                max_logits = torch.empty(shape, dtype=torch.float32, device=self.device)
-                temporary_output = torch.empty(
-                    *shape, layer.qk_head_dim, dtype=q.dtype, device=self.device
-                )
+                # Use pre-allocated buffers (required for CUDA graph address stability)
+                exp_sums = self.gluon_exp_sums[:num_seqs]
+                max_logits = self.gluon_max_logits[:num_seqs]
+                temporary_output = self.gluon_temporary_output[:num_seqs]
 
                 is_fp8 = self.kv_cache_dtype == fp8_dtype
                 compute_type = aiter_dtypes.fp8 if is_fp8 else torch.bfloat16
