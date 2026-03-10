@@ -38,7 +38,6 @@ try:
         mha_batch_prefill_func,
         mla_prefill_ps_asm_fwd,
         mla_reduce_v1,
-        paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.attention import pa_decode_gluon
@@ -101,8 +100,6 @@ class ForwardMetadata:
     context_lengths: Optional[torch.Tensor] = None
     max_context_len: Optional[int] = None
 
-
-global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
 
@@ -261,25 +258,12 @@ class AiterAttnBackend(AttentionBackend):
                     model_runner, self
                 )
 
-        # Check if using 5D block layout (ROCm + page_size > 1 + non-MLA)
-        self.use_block_layout = self.page_size > 1 and not self.use_mla
-
         # aiter kernel related initialization
         self.max_num_partitions = (
             self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
         ) // _AITER_PARTITION_SIZE_ROCM
 
-        if not self.use_mla and not self.use_block_layout:
-            nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
-            self.workspace_buffer = torch.empty(
-                (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
-                * nbyes_per_qo_elem
-                + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4,
-                dtype=torch.uint8,
-                device=self.device,
-            )
-
-        if self.use_block_layout:
+        if not self.use_mla:
             # Pre-allocate block_tables buffer for pa_decode_gluon
             max_num_blocks = (self.max_context_len + self.page_size - 1) // self.page_size
             self.max_num_blocks_per_seq = max_num_blocks
@@ -588,7 +572,7 @@ class AiterAttnBackend(AttentionBackend):
                 bs = kv_indptr.shape[0] - 1
 
             # Build block_tables and context_lengths for pa_decode_gluon (non-MLA)
-            if self.use_block_layout and (spec_info is None or forward_batch.forward_mode.is_idle()):
+            if not self.use_mla and (spec_info is None or forward_batch.forward_mode.is_idle()):
                 context_lengths = forward_batch.seq_lens.to(torch.int32)
                 max_seq_len = forward_batch.seq_lens.max().item()
                 max_num_blocks = (max_seq_len + self.page_size - 1) // self.page_size
@@ -956,7 +940,7 @@ class AiterAttnBackend(AttentionBackend):
                 prefill_kv_indices = self.indices_updater_prefill.kv_indices
                 prefill_kv_last_page_len = None
 
-                if self.use_block_layout:
+                if not self.use_mla:
                     # Convert token-level indices to page-level for mha_batch_prefill_func with 5D layout
                     page_size = self.page_size
                     num_pages_per_seq = (forward_batch.seq_lens + page_size - 1) // page_size
@@ -1093,7 +1077,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
             # Build block_tables and context_lengths for pa_decode_gluon (non-MLA)
-            if self.use_block_layout and spec_info is None:
+            if not self.use_mla and spec_info is None:
                 self.context_lengths_buf[:bs].copy_(seq_lens)
                 context_lengths = self.context_lengths_buf[:bs]
                 max_seq_len = seq_lens.max().item()
@@ -1391,7 +1375,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
             # Build block_tables and context_lengths for pa_decode_gluon (non-MLA)
-            if self.use_block_layout and spec_info is None:
+            if not self.use_mla and spec_info is None:
                 self.context_lengths_buf[:bs].copy_(seq_lens)
                 context_lengths = self.context_lengths_buf[:bs]
                 max_seq_len = seq_lens.max().item()
@@ -2022,7 +2006,7 @@ class AiterAttnBackend(AttentionBackend):
 
             # For FP8 KV cache: cast Q to FP8, pass descale=1.0
             # For flat FP8 (non-block): cast KV to BF16
-            if is_fp8 and self.use_block_layout:
+            if is_fp8 and not self.use_mla:
                 q_3d = q_3d.to(fp8_dtype)
                 descale = torch.ones(1, dtype=torch.float32, device=q_3d.device)
             elif is_fp8:
@@ -2045,9 +2029,9 @@ class AiterAttnBackend(AttentionBackend):
                 return_attn_probs=False,
                 window_size=window_size,
                 kv_last_page_lens=self.forward_metadata.kv_last_page_len,
-                q_descale=descale if is_fp8 and self.use_block_layout else None,
-                k_descale=descale if is_fp8 and self.use_block_layout else None,
-                v_descale=descale if is_fp8 and self.use_block_layout else None,
+                q_descale=descale if is_fp8 and not self.use_mla else None,
+                k_descale=descale if is_fp8 and not self.use_mla else None,
+                v_descale=descale if is_fp8 and not self.use_mla else None,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -2120,71 +2104,41 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            if self.use_block_layout:
-                # Use pa_decode_gluon with 5D block layout
-                num_seqs = q.shape[0]
+            # Use pa_decode_gluon with 5D block layout
+            num_seqs = q.shape[0]
 
-                # Use the model's max partitions to ensure CUDA graph compatibility
-                # (fixed grid dimensions and buffer shapes across replays)
-                max_context_partition_num = self.max_num_partitions
+            # Use the model's max partitions to ensure CUDA graph compatibility
+            # (fixed grid dimensions and buffer shapes across replays)
+            max_context_partition_num = self.max_num_partitions
 
-                # Use pre-allocated buffers (required for CUDA graph address stability)
-                exp_sums = self.gluon_exp_sums[:num_seqs]
-                max_logits = self.gluon_max_logits[:num_seqs]
-                temporary_output = self.gluon_temporary_output[:num_seqs]
+            # Use pre-allocated buffers (required for CUDA graph address stability)
+            exp_sums = self.gluon_exp_sums[:num_seqs]
+            max_logits = self.gluon_max_logits[:num_seqs]
+            temporary_output = self.gluon_temporary_output[:num_seqs]
 
-                is_fp8 = self.kv_cache_dtype == fp8_dtype
-                compute_type = aiter_dtypes.fp8 if is_fp8 else torch.bfloat16
+            is_fp8 = self.kv_cache_dtype == fp8_dtype
+            compute_type = aiter_dtypes.fp8 if is_fp8 else torch.bfloat16
 
-                pa_decode_gluon(
-                    output=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    key_cache=k_cache,
-                    value_cache=v_cache,
-                    context_lengths=self.forward_metadata.context_lengths,
-                    block_tables=self.forward_metadata.block_tables,
-                    softmax_scale=self.scale,
-                    query_length=1,
-                    max_context_partition_num=max_context_partition_num,
-                    context_partition_size=256,
-                    compute_type=compute_type,
-                    query_scale=None,
-                    key_scale=self.k_scale if is_fp8 else None,
-                    value_scale=self.v_scale if is_fp8 else None,
-                    exp_sums=exp_sums,
-                    max_logits=max_logits,
-                    temporary_output=temporary_output,
-                    ps=True,
-                )
-
-            else:
-                # Legacy paged_attention_ragged path
-                if self.kv_cache_dtype == fp8_dtype:
-                    dtype = q.dtype
-                    k_cache = k_cache.to(dtype)
-                    v_cache = v_cache.to(dtype)
-
-                paged_attention_ragged(
-                    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    self.workspace_buffer,
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
-                    v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim),
-                    self.scale,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.kv_last_page_len,
-                    1,
-                    self.max_num_partitions,
-                    None,
-                    "auto",
-                    "NHD",
-                    self.logits_soft_cap,
-                    self.k_scale,
-                    self.v_scale,
-                    None,
-                    _AITER_PARTITION_SIZE_ROCM,
-                )
+            pa_decode_gluon(
+                output=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                query=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                key_cache=k_cache,
+                value_cache=v_cache,
+                context_lengths=self.forward_metadata.context_lengths,
+                block_tables=self.forward_metadata.block_tables,
+                softmax_scale=self.scale,
+                query_length=1,
+                max_context_partition_num=max_context_partition_num,
+                context_partition_size=256,
+                compute_type=compute_type,
+                query_scale=None,
+                key_scale=self.k_scale if is_fp8 else None,
+                value_scale=self.v_scale if is_fp8 else None,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=temporary_output,
+                ps=True,
+            )
 
         return o
 

@@ -762,8 +762,8 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
-        # Use 5D block layout on ROCm with page_size > 1
-        self.use_block_layout = _is_hip and self.page_size > 1
+        # Use 5D block layout on ROCm (page_size defaults to 1024 on HIP)
+        self.use_block_layout = _is_hip
 
         self._create_buffers()
 
