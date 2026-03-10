@@ -2237,7 +2237,7 @@ class ServerArgs:
     def _handle_page_size(self):
         if self.page_size is None:
             if is_hip():
-                self.page_size = 16
+                self.page_size = 1024
             else:
                 self.page_size = 1
 

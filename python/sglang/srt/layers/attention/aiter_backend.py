@@ -100,66 +100,11 @@ class ForwardMetadata:
     block_tables: Optional[torch.Tensor] = None
     context_lengths: Optional[torch.Tensor] = None
     max_context_len: Optional[int] = None
-    token_kv_indptr: Optional[torch.Tensor] = None
-    token_kv_indices: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
-
-
-@triton.jit
-def _gather_5d_kv_kernel(
-    k_cache,  # [num_pages, num_kv_heads, head_dim//x, page_size, x]
-    v_cache,  # [num_pages, num_kv_heads, page_size//x, head_dim, x]
-    kv_indices,  # [total_tokens] flat slot indices
-    k_out,  # [total_tokens, num_kv_heads, head_dim]
-    v_out,  # [total_tokens, num_kv_heads, head_dim]
-    page_size: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    x: tl.constexpr,
-):
-    """Gather flat KV from 5D paged cache using token-level slot indices."""
-    token_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-
-    slot_idx = tl.load(kv_indices + token_idx)
-    page_idx = slot_idx // page_size
-    pos = slot_idx % page_size
-
-    d_offsets = tl.arange(0, head_dim)
-    d_hi = d_offsets // x
-    d_lo = d_offsets % x
-
-    # K: k_cache[page_idx, head_idx, d_hi, pos, d_lo]
-    k_stride_page = num_kv_heads * (head_dim // x) * page_size * x
-    k_off = (
-        page_idx * k_stride_page
-        + head_idx * (head_dim // x) * page_size * x
-        + d_hi * page_size * x
-        + pos * x
-        + d_lo
-    )
-    k_vals = tl.load(k_cache + k_off)
-
-    out_off = token_idx * num_kv_heads * head_dim + head_idx * head_dim + d_offsets
-    tl.store(k_out + out_off, k_vals)
-
-    # V: v_cache[page_idx, head_idx, pos//x, d, pos%x]
-    pos_hi = pos // x
-    pos_lo = pos % x
-    v_stride_page = num_kv_heads * (page_size // x) * head_dim * x
-    v_off = (
-        page_idx * v_stride_page
-        + head_idx * (page_size // x) * head_dim * x
-        + pos_hi * head_dim * x
-        + d_offsets * x
-        + pos_lo
-    )
-    v_vals = tl.load(v_cache + v_off)
-    tl.store(v_out + out_off, v_vals)
 
 
 @triton.jit
@@ -1011,10 +956,6 @@ class AiterAttnBackend(AttentionBackend):
                 prefill_kv_indices = self.indices_updater_prefill.kv_indices
                 prefill_kv_last_page_len = None
 
-                # Save token-level indices for flash_attn_varlen_func gather path
-                token_kv_indptr = prefill_kv_indptr
-                token_kv_indices = prefill_kv_indices
-
                 if self.use_block_layout:
                     # Convert token-level indices to page-level for mha_batch_prefill_func with 5D layout
                     page_size = self.page_size
@@ -1055,8 +996,6 @@ class AiterAttnBackend(AttentionBackend):
                     prefill_kv_last_page_len,
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
-                    token_kv_indptr=token_kv_indptr if self.use_block_layout else None,
-                    token_kv_indices=token_kv_indices if self.use_block_layout else None,
                 )
 
     def init_cuda_graph_state(
@@ -2078,82 +2017,38 @@ class AiterAttnBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
                 window_size = (layer.sliding_window_size, -1)
 
-            if self.use_block_layout and self.page_size < 128:
-                # Small page sizes not supported by mha_batch_prefill_func CK kernel
-                # Use gather + flash_attn_varlen_func instead
-                token_kv_indices = self.forward_metadata.token_kv_indices
-                token_kv_indptr = self.forward_metadata.token_kv_indptr
-                total_tokens = token_kv_indices.shape[0]
+            is_fp8 = self.kv_cache_dtype == fp8_dtype
+            q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
-                q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                cache_dtype = k_cache.dtype
-                x = 16 // cache_dtype.itemsize  # vector size based on cache dtype
+            # For FP8 KV cache: cast Q to FP8, pass descale=1.0
+            # For flat FP8 (non-block): cast KV to BF16
+            if is_fp8 and self.use_block_layout:
+                q_3d = q_3d.to(fp8_dtype)
+                descale = torch.ones(1, dtype=torch.float32, device=q_3d.device)
+            elif is_fp8:
+                k_cache = k_cache.to(q.dtype)
+                v_cache = v_cache.to(q.dtype)
 
-                k_flat = torch.empty(
-                    total_tokens, layer.tp_k_head_num, layer.head_dim,
-                    dtype=cache_dtype, device=q_3d.device,
-                )
-                v_flat = torch.empty_like(k_flat)
-
-                _gather_5d_kv_kernel[(total_tokens, layer.tp_k_head_num)](
-                    k_cache, v_cache, token_kv_indices,
-                    k_flat, v_flat,
-                    page_size=self.page_size,
-                    num_kv_heads=layer.tp_k_head_num,
-                    head_dim=layer.head_dim,
-                    x=x,
-                )
-
-                # Cast FP8 to compute dtype for flash attention
-                if cache_dtype != q_3d.dtype:
-                    k_flat = k_flat.to(q_3d.dtype)
-                    v_flat = v_flat.to(q_3d.dtype)
-
-                o = flash_attn_varlen_func(
-                    q_3d,
-                    k_flat,
-                    v_flat,
-                    cu_seqlens_q=self.qo_indptr[:bs0],
-                    cu_seqlens_k=token_kv_indptr[:bs0],
-                    max_seqlen_q=self.forward_metadata.max_q_len,
-                    max_seqlen_k=self.forward_metadata.max_kv_len,
-                    softmax_scale=layer.scaling,
-                    causal=True,
-                    window_size=(window_size[0], window_size[1], 0),
-                )
-            else:
-                is_fp8 = self.kv_cache_dtype == fp8_dtype
-                q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-
-                # For FP8 KV cache: cast Q to FP8, pass descale=1.0
-                # For flat FP8 (non-block): cast KV to BF16
-                if is_fp8 and self.use_block_layout:
-                    q_3d = q_3d.to(fp8_dtype)
-                    descale = torch.ones(1, dtype=torch.float32, device=q_3d.device)
-                elif is_fp8:
-                    k_cache = k_cache.to(q.dtype)
-                    v_cache = v_cache.to(q.dtype)
-
-                o = mha_batch_prefill_func(
-                    q_3d,
-                    k_cache,
-                    v_cache,
-                    self.qo_indptr[:bs0],
-                    self.forward_metadata.kv_indptr[:bs0],
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.max_q_len,
-                    self.forward_metadata.max_kv_len,
-                    causal=True,
-                    logits_soft_cap=self.logits_soft_cap,
-                    alibi_slopes=None,
-                    return_lse=False,
-                    return_attn_probs=False,
-                    window_size=window_size,
-                    kv_last_page_lens=self.forward_metadata.kv_last_page_len,
-                    q_descale=descale if is_fp8 and self.use_block_layout else None,
-                    k_descale=descale if is_fp8 and self.use_block_layout else None,
-                    v_descale=descale if is_fp8 and self.use_block_layout else None,
-                )
+            o = mha_batch_prefill_func(
+                q_3d,
+                k_cache,
+                v_cache,
+                self.qo_indptr[:bs0],
+                self.forward_metadata.kv_indptr[:bs0],
+                self.forward_metadata.kv_indices,
+                self.forward_metadata.max_q_len,
+                self.forward_metadata.max_kv_len,
+                causal=True,
+                logits_soft_cap=self.logits_soft_cap,
+                alibi_slopes=None,
+                return_lse=False,
+                return_attn_probs=False,
+                window_size=window_size,
+                kv_last_page_lens=self.forward_metadata.kv_last_page_len,
+                q_descale=descale if is_fp8 and self.use_block_layout else None,
+                k_descale=descale if is_fp8 and self.use_block_layout else None,
+                v_descale=descale if is_fp8 and self.use_block_layout else None,
+            )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
