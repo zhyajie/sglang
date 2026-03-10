@@ -838,11 +838,8 @@ class MHATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 if self.use_block_layout:
-                    # 5D block layout for ROCm pa_decode_gluon / mha_batch_prefill_func
-                    # x = vector width in elements (16 bytes / element_size)
                     x = 16 // self.store_dtype.itemsize
                     num_pages = (self.size + self.page_size) // self.page_size
-                    # K: [num_pages, num_kv_heads, head_dim // x, page_size, x]
                     self.k_buffer = [
                         torch.zeros(
                             (num_pages, self.head_num, self.head_dim // x, self.page_size, x),
@@ -851,7 +848,6 @@ class MHATokenToKVPool(KVCache):
                         )
                         for _ in range(self.layer_num)
                     ]
-                    # V: [num_pages, num_kv_heads, page_size // x, v_head_dim, x]
                     self.v_buffer = [
                         torch.zeros(
                             (num_pages, self.head_num, self.page_size // x, self.v_head_dim, x),
@@ -977,9 +973,7 @@ class MHATokenToKVPool(KVCache):
         torch.cuda.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
         if self.use_block_layout:
-            # 5D block layout: return as-is, dtype reinterpretation not needed
             return self.k_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -994,9 +988,7 @@ class MHATokenToKVPool(KVCache):
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
         if self.use_block_layout:
-            # 5D block layout: return as-is, dtype reinterpretation not needed
             return self.v_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -1033,11 +1025,8 @@ class MHATokenToKVPool(KVCache):
 
             k_cache = self.k_buffer[layer_id - self.start_layer]
             v_cache = self.v_buffer[layer_id - self.start_layer]
-            # cache_k/cache_v shape: [num_tokens, num_heads, head_dim]
-            # loc is the flat slot_mapping (token-level indices)
             is_fp8 = self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             kv_cache_dtype = "fp8" if is_fp8 else "auto"
-            # Convert scalar scales to tensors for reshape_and_cache
             k_scale_t = (
                 torch.tensor([k_scale], dtype=torch.float32, device=self.device)
                 if isinstance(k_scale, (int, float))
